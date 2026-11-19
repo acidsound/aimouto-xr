@@ -1,0 +1,6 @@
+{
+  "name": "AIMouto-XR | AI Little Sister 3D Companion",
+  "description": "AIMouto-XR (AI + imouto): 3D VRM little-sister companion in a cozy rainy-night bedroom with MotionBricks whole-body interaction, OpenAI-compatible APIs, plugins, voice/text I/O, and WebXR.",
+  "requestFramePermissions": ["microphone", "camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
