@@ -26,8 +26,13 @@ import {
   LofiRoomEnvironment,
 } from './LofiRoomEnvironment';
 import {
+  ContactAuditSnapshot,
+  WorldContactSurface,
+} from '../avatar/motionbricks/ContactContract';
+import {
   ImmersiveVRController,
   VRSessionStatus,
+  XRCoreLike,
 } from './vrSessionController';
 
 export interface SceneHoverHint {
@@ -38,14 +43,16 @@ export interface SceneHoverHint {
 }
 
 export interface SceneHooks {
-  onAvatarPoke?: () => void;
+  onAvatarPoke?: (situation: string) => void;
   onPropInteracted?: (
     propId: RoomPropId,
     pose: MotionBrickPose,
-    reactionText: string
+    situation: string
   ) => void;
   onHandHoldChanged?: (active: boolean) => void;
+  onHandHoldSituation?: (situation: string) => void;
   onMotionStateChanged?: (snapshot: MotionBrickSnapshot) => void;
+  onContactAuditChanged?: (audit: ContactAuditSnapshot) => void;
   onHoverHintChanged?: (hint: SceneHoverHint | null) => void;
   onSpatialChatSubmit?: (text: string) => void;
   onSpatialQuickAction?: (actionId: string) => void;
@@ -67,59 +74,63 @@ const _xrDir = new THREE.Vector3();
 const _xrRotMat = new THREE.Matrix4();
 const _xrCtrlWorld = new THREE.Vector3();
 
-const PROP_REACTIONS: Record<
+/**
+ * Objective situational descriptions of each room action for LLM context.
+ * Actual spoken dialogue is generated dynamically from conversation context + situation.
+ */
+const PROP_SITUATIONS: Record<
   RoomPropId,
-  {emotion: AvatarEmotion; line: string}
+  {emotion: AvatarEmotion; situation: string}
 > = {
   floor: {
-    emotion: AvatarEmotion.HAPPY,
-    line: '총총총~ 여기로 걸어왔어!',
+    emotion: AvatarEmotion.NEUTRAL,
+    situation: '방 안의 다른 바닥 위치로 걸어서 이동했다.',
   },
   desk_lamp: {
     emotion: AvatarEmotion.CURIOUS,
-    line: '딸깍! 책상 스탠드 조명을 조절했어.',
+    situation: '책상 스탠드 쪽으로 이동해 조명을 조작했다.',
   },
   desk_chair: {
-    emotion: AvatarEmotion.HAPPY,
-    line: '책상 앞에 앉으니까 비 오는 밤 감성이 확 올라오네~',
+    emotion: AvatarEmotion.NEUTRAL,
+    situation: '책상으로 이동해 의자에 앉았다.',
   },
   laptop: {
     emotion: AvatarEmotion.THINKING,
-    line: '타닥타닥... 노트북 화면 바꾸고 작업 모드 시작!',
+    situation: '책상으로 이동해 노트북 앞에 앉아 작업 화면을 조작하기 시작했다.',
   },
   coffee_mug: {
     emotion: AvatarEmotion.HAPPY,
-    line: '후우~ 따뜻한 커피 한 모금 마시니까 잠이 싹 달아난다!',
+    situation: '책상 위의 따뜻한 커피 머그잔을 들어 한 모금 마셨다.',
   },
   window: {
     emotion: AvatarEmotion.CURIOUS,
-    line: '창밖 밤하늘이랑 빗방울이 너무 운치 있지 않아?',
+    situation: '창가로 이동해 밤하늘과 창밖 풍경을 바라보았다.',
   },
   bed: {
     emotion: AvatarEmotion.SLEEPY,
-    line: '푹신한 침대 걸터앉기~ 여기서 같이 쉴래?',
+    situation: '침대로 이동해 걸터앉았다.',
   },
   cat_plushie: {
     emotion: AvatarEmotion.LOVE,
-    line: '쓰담쓰담~ 우리 방 고양이 인형 너무 귀엽지?',
+    situation: '침대 위의 고양이 인형에게 다가가 쓰다듬었다.',
   },
   bookshelf: {
-    emotion: AvatarEmotion.HAPPY,
-    line: '바이닐 턴테이블 체크! 잔잔한 음악이 계속 돌고 있어~',
+    emotion: AvatarEmotion.NEUTRAL,
+    situation: '책장 앞 바이닐 턴테이블로 이동해 음악 상태를 확인했다.',
   },
   toy_ball: {
     emotion: AvatarEmotion.HAPPY,
-    line: '통통! 별빛 공이 방 안을 데굴데굴 굴러가네!',
+    situation: '바닥의 별빛 공 쪽으로 다가가 발로 가볍게 찼다.',
   },
   floor_cushion: {
-    emotion: AvatarEmotion.HAPPY,
-    line: '폭신한 방석을 툭 밀었어~ 여기 앉아서 쉴까?',
+    emotion: AvatarEmotion.NEUTRAL,
+    situation: '바닥의 폭신한 쿠션 쪽으로 다가가 밀어 옮겼다.',
   },
   plush_die: {
     emotion: AvatarEmotion.CURIOUS,
-    line: '데구르르! 플러시 주사위가 굴러갔어~ 몇이 나왔을까?',
+    situation: '바닥의 플러시 주사위 쪽으로 다가가 굴렸다.',
   },
-} as Record<RoomPropId, {emotion: AvatarEmotion; line: string}>;
+} as Record<RoomPropId, {emotion: AvatarEmotion; situation: string}>;
 
 export class NeuroAvatarScene extends xb.Script {
   private readonly vrmManager = new VrmAvatarManager();
@@ -169,6 +180,18 @@ export class NeuroAvatarScene extends xb.Script {
     dragStarted: false,
   };
   private handHoldModePinned = false;
+  private handHoldStartPos = new THREE.Vector3();
+  // 3D Contact-Contract Debug Overlay (target prop surface + final body region + error vector)
+  private contactDebugGroup = new THREE.Group();
+  private debugTargetBox!: THREE.LineSegments;
+  private debugTargetSphere!: THREE.LineSegments;
+  private debugTargetNormalArrow!: THREE.ArrowHelper;
+  private debugBodySphere!: THREE.LineSegments;
+  private debugErrorLine!: THREE.Line;
+  private debugErrorPositions = new Float32Array(6);
+  private contactDebugEnabled = false;
+  private lastAuditEmitMs = 0;
+
   private activeXrGrabController: THREE.Object3D | null = null;
   private lastHoverCheckMs = 0;
   private lastSnapshotKey = '';
@@ -261,11 +284,48 @@ export class NeuroAvatarScene extends xb.Script {
     this.add(this.room.group);
     this.motionBricks.setObstacles(this.room.obstacles);
 
+    // Attach single-path WebXR session coordinator & simulator XR render bridge
+    this.vrController.attachToCore(xb.core as unknown as XRCoreLike, {
+      onStatusChanged: (status) => {
+        this.applyVRVisualState(status);
+        this.hooks.onVRStatusChanged?.(status);
+      },
+    });
+
+    // Ensure color + depth buffers are cleared cleanly before rendering the bedroom.
+    // While presenting in real WebXR (`webgl.xr.isPresenting === true`), Three.js owns the
+    // bound XR framebuffer and stereo eye viewports, so we NEVER call setRenderTarget(null)
+    // or manual pre-render clear — we let `webgl.render(s, cam)` clear and draw directly
+    // into the headset's XR render target.
+    xb.core.renderSceneOverride = (r, s, cam) => {
+      const webgl = r as THREE.WebGLRenderer;
+      const isXRPresenting = Boolean(webgl.xr?.isPresenting);
+      const isARPassthrough =
+        (this.inXRSession || isXRPresenting) &&
+        xb.core.transition?.currentMode === 'AR';
+      const prevAutoClear = webgl.autoClear;
+      const prevAutoClearColor = webgl.autoClearColor;
+      if (isARPassthrough) {
+        webgl.setClearColor(0x000000, 0);
+      } else {
+        webgl.setClearColor(this.room?.skyColorHex ?? 0x0e1024, 1);
+      }
+      webgl.autoClear = true;
+      webgl.autoClearColor = true;
+      if (!isXRPresenting) {
+        webgl.clear(true, true, true);
+      }
+      webgl.render(s, cam);
+      webgl.autoClear = prevAutoClear;
+      webgl.autoClearColor = prevAutoClearColor;
+    };
+
     // Avatar root sits directly on the bedroom floor (y = 0) and moves via MotionBricks
     this.avatarRoot.name = 'AIMoutoAvatarAnchor';
     this.avatarRoot.position.copy(this.motionBricks.rootPosition);
     this.avatarRoot.add(this.vrmManager.containerGroup);
     this.buildAvatarHitboxesAndTether();
+    this.buildContactDebugOverlay();
     this.add(this.avatarRoot);
     this.add(this.vrController.vrEnvironmentGroup);
 
@@ -357,6 +417,154 @@ export class NeuroAvatarScene extends xb.Script {
     this.handTetherLine.frustumCulled = false;
     this.handTetherLine.visible = false;
     this.add(this.handTetherLine);
+  }
+
+  private buildContactDebugOverlay(): void {
+    this.contactDebugGroup.name = 'ContactContractDebugOverlay';
+    this.contactDebugGroup.visible = false;
+
+    const unitBoxEdges = new THREE.EdgesGeometry(new THREE.BoxGeometry(2, 2, 2));
+    this.debugTargetBox = new THREE.LineSegments(
+      unitBoxEdges,
+      new THREE.LineBasicMaterial({
+        color: 0x4be3ff,
+        depthTest: false,
+        transparent: true,
+        opacity: 0.95,
+      })
+    );
+    this.debugTargetBox.renderOrder = 998;
+    this.debugTargetBox.visible = false;
+
+    const unitSphereEdges = new THREE.EdgesGeometry(new THREE.IcosahedronGeometry(1, 1));
+    this.debugTargetSphere = new THREE.LineSegments(
+      unitSphereEdges,
+      new THREE.LineBasicMaterial({
+        color: 0x4be3ff,
+        depthTest: false,
+        transparent: true,
+        opacity: 0.95,
+      })
+    );
+    this.debugTargetSphere.renderOrder = 998;
+    this.debugTargetSphere.visible = false;
+
+    this.debugTargetNormalArrow = new THREE.ArrowHelper(
+      new THREE.Vector3(0, 1, 0),
+      new THREE.Vector3(),
+      0.28,
+      0x4be3ff,
+      0.07,
+      0.04
+    );
+    this.debugTargetNormalArrow.visible = false;
+
+    this.debugBodySphere = new THREE.LineSegments(
+      new THREE.EdgesGeometry(new THREE.IcosahedronGeometry(1, 1)),
+      new THREE.LineBasicMaterial({
+        color: 0x34f59b,
+        depthTest: false,
+        transparent: true,
+        opacity: 0.95,
+      })
+    );
+    this.debugBodySphere.renderOrder = 999;
+    this.debugBodySphere.visible = false;
+
+    const errGeo = new THREE.BufferGeometry();
+    errGeo.setAttribute(
+      'position',
+      new THREE.BufferAttribute(this.debugErrorPositions, 3)
+    );
+    this.debugErrorLine = new THREE.Line(
+      errGeo,
+      new THREE.LineBasicMaterial({
+        color: 0xffd166,
+        depthTest: false,
+        transparent: true,
+        opacity: 0.95,
+      })
+    );
+    this.debugErrorLine.frustumCulled = false;
+    this.debugErrorLine.renderOrder = 1000;
+    this.debugErrorLine.visible = false;
+
+    this.contactDebugGroup.add(
+      this.debugTargetBox,
+      this.debugTargetSphere,
+      this.debugTargetNormalArrow,
+      this.debugBodySphere,
+      this.debugErrorLine
+    );
+    this.add(this.contactDebugGroup);
+  }
+
+  private updateContactDebugVisuals(audit: ContactAuditSnapshot): void {
+    if (!this.contactDebugEnabled) return;
+    const surf = audit.targetSurface;
+    if (surf) {
+      if (surf.shape === 'sphere') {
+        this.debugTargetBox.visible = false;
+        this.debugTargetSphere.visible = true;
+        this.debugTargetSphere.position.copy(surf.center);
+        this.debugTargetSphere.scale.setScalar(surf.radius);
+      } else {
+        this.debugTargetSphere.visible = false;
+        this.debugTargetBox.visible = true;
+        this.debugTargetBox.position.copy(surf.center);
+        const basis = new THREE.Matrix4().makeBasis(
+          surf.axes[0],
+          surf.axes[1],
+          surf.axes[2]
+        );
+        this.debugTargetBox.quaternion.setFromRotationMatrix(basis);
+        this.debugTargetBox.scale.set(
+          Math.max(0.015, surf.halfExtents.x),
+          Math.max(0.01, surf.halfExtents.y),
+          Math.max(0.015, surf.halfExtents.z)
+        );
+      }
+      this.debugTargetNormalArrow.visible = true;
+      this.debugTargetNormalArrow.position.copy(surf.center);
+      this.debugTargetNormalArrow.setDirection(surf.normal);
+    } else {
+      this.debugTargetBox.visible = false;
+      this.debugTargetSphere.visible = false;
+      this.debugTargetNormalArrow.visible = false;
+    }
+
+    const body = audit.bodyRegion;
+    if (body) {
+      this.debugBodySphere.visible = true;
+      this.debugBodySphere.position.copy(body.center);
+      this.debugBodySphere.scale.set(
+        Math.max(0.03, body.halfExtents[0]),
+        Math.max(0.025, body.halfExtents[1]),
+        Math.max(0.03, body.halfExtents[2])
+      );
+      const mat = this.debugBodySphere.material as THREE.LineBasicMaterial;
+      if (audit.status === 'failed') mat.color.setHex(0xff4d6d);
+      else if (audit.verification?.valid) mat.color.setHex(0x34f59b);
+      else mat.color.setHex(0xffbe0b);
+    } else {
+      this.debugBodySphere.visible = false;
+    }
+
+    const ver = audit.verification;
+    if (ver) {
+      this.debugErrorPositions[0] = ver.bodyContactPoint.x;
+      this.debugErrorPositions[1] = ver.bodyContactPoint.y;
+      this.debugErrorPositions[2] = ver.bodyContactPoint.z;
+      this.debugErrorPositions[3] = ver.closestSurfacePoint.x;
+      this.debugErrorPositions[4] = ver.closestSurfacePoint.y;
+      this.debugErrorPositions[5] = ver.closestSurfacePoint.z;
+      this.debugErrorLine.geometry.attributes.position.needsUpdate = true;
+      const errMat = this.debugErrorLine.material as THREE.LineBasicMaterial;
+      errMat.color.setHex(ver.valid ? 0x34f59b : 0xff4d6d);
+      this.debugErrorLine.visible = true;
+    } else {
+      this.debugErrorLine.visible = false;
+    }
   }
 
   private updateAvatarHitboxes(): void {
@@ -455,41 +663,54 @@ export class NeuroAvatarScene extends xb.Script {
       return {ok: false, message: `Unknown room prop: ${propId}`};
     }
 
-    if (this.physicsSim?.isDynamicProp(propId)) {
-      const pos = this.physicsSim.getDynamicPropPosition(propId) ?? prop.reachTargetWorld;
-      const actionName =
-        propId === 'toy_ball'
-          ? 'kick'
-          : propId === 'plush_die'
-            ? 'pickup'
-            : 'push';
-      const motionPose =
-        propId === 'toy_ball'
-          ? 'kick_ball'
-          : propId === 'plush_die'
-            ? 'pickup_die'
-            : 'push_prop';
-      const propWorldVec = new THREE.Vector3(pos.x, pos.y, pos.z);
-      this.room.showFloorDestinationMarker(pos.x, pos.z);
+    const liveSurface = this.room.getPropWorldSurface(propId);
+    if (!liveSurface) {
+      return {ok: false, message: `Could not resolve world surface for ${propId}`};
+    }
 
-      this.motionBricks.executePropAction({
-        propId,
-        pose: motionPose,
-        actionName,
-        propWorldPos: propWorldVec,
-        lookAtWorld: propWorldVec,
-        onContact: () => {
-          const livePos =
-            this.physicsSim?.getDynamicPropPosition(propId) ?? pos;
-          let dx = livePos.x - this.motionBricks.rootPosition.x;
-          let dz = livePos.z - this.motionBricks.rootPosition.z;
+    let nextPose: MotionBrickPose = poseOverride ?? prop.targetPose;
+    // Toggle between sitting upright and lounging on repeated Bed click
+    if (
+      propId === 'bed' &&
+      !poseOverride &&
+      this.motionBricks.pose === 'sit_bed'
+    ) {
+      nextPose = 'lounge_bed';
+    }
+
+    this.room.showFloorDestinationMarker(liveSurface.center.x, liveSurface.center.z);
+
+    const isDynamic = Boolean(this.physicsSim?.isDynamicProp(propId));
+    const colliderPoseProvider = isDynamic
+      ? () => {
+          const p = this.physicsSim?.getDynamicPropPose(propId as DynamicPropId);
+          if (!p) return null;
+          return {
+            position: {x: p.x, y: p.y, z: p.z},
+            quaternion: {x: p.qx, y: p.qy, z: p.qz, w: p.qw},
+          };
+        }
+      : undefined;
+
+    const result = this.motionBricks.executeCommand({
+      propId,
+      pose: nextPose,
+      contactSurface: prop.contactSurface,
+      contract: prop.contract,
+      surfaceObject: prop.surfaceObject,
+      colliderPoseProvider,
+      secondarySurface: prop.secondarySurface,
+      onContactVerified: (_verification, verifiedSurface: WorldContactSurface) => {
+        if (isDynamic && this.physicsSim) {
+          let dx = verifiedSurface.center.x - this.motionBricks.rootPosition.x;
+          let dz = verifiedSurface.center.z - this.motionBricks.rootPosition.z;
           const len = Math.hypot(dx, dz);
           if (len > 0.02) {
             dx /= len;
             dz /= len;
           } else {
-            dx = 0.28;
-            dz = -0.96;
+            dx = Math.sin(this.motionBricks.rootYaw);
+            dz = Math.cos(this.motionBricks.rootYaw);
           }
 
           const impulse =
@@ -506,72 +727,96 @@ export class NeuroAvatarScene extends xb.Script {
                   z: (Math.random() - 0.5) * 0.16,
                 }
               : undefined;
+          this.physicsSim.applyPropImpulse(propId as DynamicPropId, impulse, torque);
+        }
 
-          this.physicsSim?.applyPropImpulse(propId, impulse, torque);
-          const meta = PROP_REACTIONS[propId];
-          this.animator.setEmotion(meta.emotion);
-          this.hooks.onPropInteracted?.(propId, motionPose, meta.line);
-          this.syncSpatialStatus();
-        },
-        onComplete: () => {
-          this.syncSpatialStatus();
-        },
-      });
-      return {
-        ok: true,
-        message: `Running MotionBricks ${actionName} on ${propId}`,
-      };
-    }
-
-    let nextPose: MotionBrickPose = poseOverride ?? prop.targetPose;
-    // Toggle between sitting upright and lounging on repeated Bed click!
-    if (
-      propId === 'bed' &&
-      !poseOverride &&
-      this.motionBricks.pose === 'sit_bed'
-    ) {
-      nextPose = 'lounge_bed';
-    }
-
-    this.room.showFloorDestinationMarker(prop.approachPos.x, prop.approachPos.z);
-    this.motionBricks.enqueueCommand({
-      propId,
-      pose: nextPose,
-      approachPos: prop.approachPos,
-      approachYaw: prop.approachYaw,
-      reachTargetWorld: prop.reachTargetWorld,
-      lookAtWorld: prop.lookAtWorld,
-      onArrive: () => {
         const propNote = this.room.triggerPropEffect(propId);
-        const meta = PROP_REACTIONS[propId];
+        const meta = PROP_SITUATIONS[propId];
         const finalEmotion =
           nextPose === 'lounge_bed' ? AvatarEmotion.SLEEPY : meta.emotion;
         this.animator.setEmotion(finalEmotion);
-        const text = propNote || meta.line;
-        this.hooks.onPropInteracted?.(propId, nextPose, text);
+        const situation =
+          nextPose === 'lounge_bed'
+            ? 'AIMouto가 침대에 편하게 기대어 쉬기 시작했다.'
+            : `AIMouto가 ${propNote || meta.situation}`;
+        this.hooks.onPropInteracted?.(propId, nextPose, situation);
+        this.syncSpatialStatus();
+      },
+      onContactLost: () => {
+        this.syncSpatialStatus();
+      },
+      onFailed: () => {
+        this.syncSpatialStatus();
+      },
+      onComplete: () => {
         this.syncSpatialStatus();
       },
     });
 
+    if (!result.accepted) {
+      return {
+        ok: false,
+        message: `Contact rejected for ${propId}: ${result.reason} (${result.detail})`,
+      };
+    }
+
     return {
       ok: true,
-      message: `Moving to ${propId} (${nextPose})`,
+      message: `Executing contact contract for ${propId} (${nextPose})`,
     };
+  }
+
+  private describeRoomAreaNear(pos: THREE.Vector3): string {
+    const candidates: Array<{label: string; propId: RoomPropId}> = [
+      {label: '책상 근처', propId: 'desk_chair'},
+      {label: '침대 근처', propId: 'bed'},
+      {label: '창가 근처', propId: 'window'},
+      {label: '책장 근처', propId: 'bookshelf'},
+    ];
+    let bestLabel = '방 중앙 러그 근처';
+    let bestDist = 0.95;
+    for (const item of candidates) {
+      const surf = this.room?.getPropWorldSurface(item.propId);
+      if (!surf) continue;
+      const d = Math.hypot(pos.x - surf.center.x, pos.z - surf.center.z);
+      if (d < bestDist) {
+        bestDist = d;
+        bestLabel = item.label;
+      }
+    }
+    return bestLabel;
+  }
+
+  private describeHandHoldRelease(): string {
+    const movedDist = this.motionBricks.rootPosition.distanceTo(
+      this.handHoldStartPos
+    );
+    if (movedDist >= 0.15) {
+      const areaLabel = this.describeRoomAreaNear(this.motionBricks.rootPosition);
+      return `사용자가 AIMouto의 손을 잡고 방 안을 약 ${movedDist.toFixed(1)}m 걸어 ${areaLabel}까지 함께 이동한 뒤 손을 놓았다.`;
+    }
+    return '사용자가 잠시 AIMouto의 손을 잡았다가 놓았다.';
   }
 
   togglePinnedHandHoldMode(): boolean {
     this.handHoldModePinned = !this.handHoldModePinned;
     if (this.handHoldModePinned) {
+      this.handHoldStartPos.copy(this.motionBricks.rootPosition);
       this.motionBricks.getHandWorldPosition('right', _handWorld);
       this.motionBricks.startHandHold(_handWorld, 'right');
       this.animator.setEmotion(AvatarEmotion.LOVE);
       if (this.orbitControls) this.orbitControls.enabled = false;
+      this.hooks.onHandHoldChanged?.(true);
+      this.hooks.onHandHoldSituation?.(
+        '사용자가 AIMouto의 손을 잡고 방 안을 함께 걸어 다닐 준비를 했다.'
+      );
     } else {
       this.motionBricks.stopHandHold();
       this.animator.setEmotion(AvatarEmotion.NEUTRAL);
       if (this.orbitControls) this.orbitControls.enabled = !this.inXRSession;
+      this.hooks.onHandHoldChanged?.(false);
+      this.hooks.onHandHoldSituation?.(this.describeHandHoldRelease());
     }
-    this.hooks.onHandHoldChanged?.(this.handHoldModePinned);
     return this.handHoldModePinned;
   }
 
@@ -580,12 +825,10 @@ export class NeuroAvatarScene extends xb.Script {
   }
 
   /**
-   * 'XRButton' click handler: initializes Three.js WebXR `immersive-vr` session
-   * or toggles the Immersive VR room preview on desktop.
+   * Synchronizes spatial cards, OrbitControls, and desktop preview camera with
+   * the authoritative WebXR session status reported by XR Blocks' WebXRSessionManager.
    */
-  async handleXRButtonClick(): Promise<VRSessionStatus> {
-    const renderer = xb.core.renderer as THREE.WebGLRenderer | undefined;
-    const status = await this.vrController.enterImmersiveVR(renderer, xb.core.scene);
+  private applyVRVisualState(status: VRSessionStatus): void {
     const vrActive = status.state !== 'idle';
 
     if (xb.core.transition?.currentMode === 'VR') {
@@ -594,7 +837,8 @@ export class NeuroAvatarScene extends xb.Script {
 
     this.spatialCardsGroup.visible = vrActive || this.spatialCardsVisible;
     if (this.orbitControls) {
-      this.orbitControls.enabled = status.state !== 'immersive-vr';
+      this.orbitControls.enabled =
+        status.state !== 'immersive-vr' && !this.inXRSession && !this.handHoldModePinned;
     }
 
     if (vrActive) {
@@ -607,7 +851,7 @@ export class NeuroAvatarScene extends xb.Script {
         this.orbitControls?.target.set(-0.08, 0.92, -1.78);
         this.orbitControls?.update();
       }
-    } else if (xb.core.camera) {
+    } else if (!this.inXRSession && xb.core.camera) {
       if (xb.core.camera instanceof THREE.PerspectiveCamera) {
         xb.core.camera.fov = 56;
         xb.core.camera.updateProjectionMatrix();
@@ -616,13 +860,40 @@ export class NeuroAvatarScene extends xb.Script {
       this.orbitControls?.target.set(-0.08, 0.92, -1.78);
       this.orbitControls?.update();
     }
+  }
 
+  /**
+   * HUD 'Enter VR' click handler: routes exclusively through XR Blocks' single
+   * `WebXRSessionManager` (or toggles desktop preview when WebXR hardware is absent).
+   */
+  async handleXRButtonClick(): Promise<VRSessionStatus> {
+    const status = await this.vrController.toggleVRFromHud(
+      xb.core as unknown as XRCoreLike,
+      xb.core.scene
+    );
+    this.applyVRVisualState(status);
     this.hooks.onVRStatusChanged?.(status);
     return status;
   }
 
   get vrModeActive(): boolean {
     return this.vrController.isVRModeActive;
+  }
+
+  setContactDebugVisible(visible: boolean): void {
+    this.contactDebugEnabled = visible;
+    this.contactDebugGroup.visible = visible;
+    if (visible) {
+      this.updateContactDebugVisuals(this.motionBricks.getContactAudit());
+    }
+  }
+
+  get contactDebugVisible(): boolean {
+    return this.contactDebugEnabled;
+  }
+
+  getContactAudit(): ContactAuditSnapshot {
+    return this.motionBricks.getContactAudit();
   }
 
   // ---- Desktop Pointer Events for Hand-Hold Drag + Prop Clicking ----
@@ -704,6 +975,7 @@ export class NeuroAvatarScene extends xb.Script {
           this.setRayFromClient(e.clientX, e.clientY);
           const got = _raycaster.ray.intersectPlane(_handPlane, _planeHit);
           if (got) {
+            this.handHoldStartPos.copy(this.motionBricks.rootPosition);
             this.motionBricks.startHandHold(
               _planeHit,
               this.pointerDownState.hitSide
@@ -792,10 +1064,13 @@ export class NeuroAvatarScene extends xb.Script {
           this.motionBricks.stopHandHold();
           this.animator.setEmotion(AvatarEmotion.HAPPY);
           this.hooks.onHandHoldChanged?.(false);
+          this.hooks.onHandHoldSituation?.(this.describeHandHoldRelease());
         }
       } else {
-        // Short click on AIMouto -> friendly poke/headpat reaction
-        this.hooks.onAvatarPoke?.();
+        // Short click on AIMouto -> factual situation for LLM reaction
+        this.hooks.onAvatarPoke?.(
+          '사용자가 방 안에서 AIMouto의 어깨나 머리를 가볍게 톡 건드렸다.'
+        );
       }
       return;
     }
@@ -847,6 +1122,7 @@ export class NeuroAvatarScene extends xb.Script {
 
     if (distR < 0.55 || distL < 0.55 || avatarHits.length > 0) {
       this.activeXrGrabController = ctrl;
+      this.handHoldStartPos.copy(this.motionBricks.rootPosition);
       const side: 'left' | 'right' = distL < distR ? 'left' : 'right';
       this.motionBricks.startHandHold(_xrCtrlWorld, side);
       this.animator.setEmotion(AvatarEmotion.LOVE);
@@ -873,6 +1149,7 @@ export class NeuroAvatarScene extends xb.Script {
       this.motionBricks.stopHandHold();
       this.animator.setEmotion(AvatarEmotion.NEUTRAL);
       this.hooks.onHandHoldChanged?.(false);
+      this.hooks.onHandHoldSituation?.(this.describeHandHoldRelease());
     }
   }
 
@@ -881,6 +1158,7 @@ export class NeuroAvatarScene extends xb.Script {
     if (!ctrl) return;
     ctrl.getWorldPosition(_xrCtrlWorld);
     this.activeXrGrabController = ctrl;
+    this.handHoldStartPos.copy(this.motionBricks.rootPosition);
     this.motionBricks.startHandHold(_xrCtrlWorld);
     this.animator.setEmotion(AvatarEmotion.LOVE);
     this.hooks.onHandHoldChanged?.(true);
@@ -895,6 +1173,7 @@ export class NeuroAvatarScene extends xb.Script {
       this.motionBricks.stopHandHold();
       this.animator.setEmotion(AvatarEmotion.NEUTRAL);
       this.hooks.onHandHoldChanged?.(false);
+      this.hooks.onHandHoldSituation?.(this.describeHandHoldRelease());
     }
   }
 
@@ -1117,6 +1396,7 @@ export class NeuroAvatarScene extends xb.Script {
 
   onXRSessionStarted(): void {
     this.inXRSession = true;
+    this.vrController.renderBridge.suspendSimulatorForXR();
     if (this.orbitControls) this.orbitControls.enabled = false;
     this.vrController.setVRVisualsActive(true);
     this.spatialCardsGroup.visible = true;
@@ -1126,13 +1406,15 @@ export class NeuroAvatarScene extends xb.Script {
   onXRSessionEnded(): void {
     this.inXRSession = false;
     this.activeXrGrabController = null;
-    if (this.orbitControls) this.orbitControls.enabled = true;
+    this.vrController.renderBridge.restoreSimulatorAfterXR();
+    if (this.orbitControls) this.orbitControls.enabled = !this.handHoldModePinned;
     this.vrController.setVRVisualsActive(false);
     this.spatialCardsGroup.visible = this.spatialCardsVisible;
     this.hooks.onXRModeChanged?.(false);
   }
 
   onSimulatorStarted(): void {
+    this.vrController.onSimulatorStarted(xb.core as unknown as XRCoreLike);
     // Clear any stray XR Blocks default simulator room meshes (couch/apartment)
     (
       xb.core as unknown as {
@@ -1213,9 +1495,45 @@ export class NeuroAvatarScene extends xb.Script {
       this.room?.updateCameraCulling(xb.core.camera);
     }
 
-    // Emit MotionBrick + Rapier physics snapshot change notifications cleanly
+    // Emit MotionBrick + Rapier physics snapshot & Contact Audit telemetry
     const snap = this.motionBricks.getSnapshot();
-    const key = `${snap.pose}|${snap.activeProp ?? ''}|${snap.handHoldActive}|${snap.physicsActive ? 1 : 0}|${snap.grounded ? 1 : 0}|${snap.motionBackend ?? ''}`;
+    const audit = this.motionBricks.getContactAudit();
+    if (this.contactDebugEnabled) {
+      this.updateContactDebugVisuals(audit);
+    }
+    const nowMs = performance.now();
+    if (nowMs - this.lastAuditEmitMs > 100) {
+      this.lastAuditEmitMs = nowMs;
+      this.hooks.onContactAuditChanged?.(audit);
+      if (typeof window !== 'undefined') {
+        (window as unknown as {__AIMOUTO_CONTACT_AUDIT__?: unknown}).__AIMOUTO_CONTACT_AUDIT__ = {
+          propId: audit.propId,
+          pose: audit.pose,
+          status: audit.status,
+          frameSource: audit.frameSource,
+          bodyRegionId: audit.bodyRegionId,
+          contractKind: audit.contractKind,
+          failureReason: audit.failureReason,
+          replanCount: audit.replanCount,
+          sustainedFrames: audit.sustainedFrames,
+          gapMm: audit.verification
+            ? Math.round(audit.verification.gapMeters * 1000)
+            : null,
+          penetrationMm: audit.verification
+            ? Math.round(audit.verification.penetrationMeters * 1000)
+            : null,
+          correctionMm: audit.verification
+            ? Math.round(audit.verification.correctionAppliedMeters * 1000)
+            : null,
+          normalAlignment: audit.verification
+            ? Number(audit.verification.normalAlignment.toFixed(3))
+            : null,
+          valid: audit.verification?.valid ?? null,
+        };
+      }
+    }
+
+    const key = `${snap.pose}|${snap.activeProp ?? ''}|${snap.handHoldActive}|${snap.physicsActive ? 1 : 0}|${snap.grounded ? 1 : 0}|${snap.frameSource ?? ''}|${snap.contactStatus ?? ''}|${snap.contactFailureReason ?? ''}`;
     if (key !== this.lastSnapshotKey) {
       this.lastSnapshotKey = key;
       this.hooks.onMotionStateChanged?.(snap);
@@ -1224,6 +1542,7 @@ export class NeuroAvatarScene extends xb.Script {
   }
 
   dispose(): void {
+    xb.core.renderSceneOverride = undefined;
     this.motionBricks.dispose();
     this.domElement?.removeEventListener('pointerdown', this.onCanvasPointerDown);
     window.removeEventListener('pointermove', this.onWindowPointerMove);
@@ -1244,6 +1563,22 @@ export class NeuroAvatarScene extends xb.Script {
     this.handTetherLine?.geometry.dispose();
     if (this.handTetherLine?.material instanceof THREE.Material) {
       this.handTetherLine.material.dispose();
+    }
+    this.debugTargetBox?.geometry.dispose();
+    if (this.debugTargetBox?.material instanceof THREE.Material) {
+      this.debugTargetBox.material.dispose();
+    }
+    this.debugTargetSphere?.geometry.dispose();
+    if (this.debugTargetSphere?.material instanceof THREE.Material) {
+      this.debugTargetSphere.material.dispose();
+    }
+    this.debugBodySphere?.geometry.dispose();
+    if (this.debugBodySphere?.material instanceof THREE.Material) {
+      this.debugBodySphere.material.dispose();
+    }
+    this.debugErrorLine?.geometry.dispose();
+    if (this.debugErrorLine?.material instanceof THREE.Material) {
+      this.debugErrorLine.material.dispose();
     }
     this.orbitControls?.dispose();
     this.animator.dispose();

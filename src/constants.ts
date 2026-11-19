@@ -23,7 +23,6 @@ export const DEFAULT_OPENAI_CONFIG: OpenAICompatConfig = {
   systemPrompt: DEFAULT_SYSTEM_PROMPT,
   temperature: 0.85,
   useProxy: true,
-  demoFallbackEnabled: true,
   customEndpoint: false,
 };
 

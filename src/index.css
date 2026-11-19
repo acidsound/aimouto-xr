@@ -523,6 +523,71 @@ body {
   color: #fbcfe8;
 }
 
+/* Contact-Contract Debug Popover */
+.contact-audit-popover {
+  position: absolute;
+  left: 18px;
+  top: 222px;
+  width: 292px;
+  padding: 10px 12px;
+  flex-direction: column;
+  gap: 5px;
+  font-size: 0.72rem;
+  line-height: 1.3;
+}
+
+.audit-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  color: #cbd5e1;
+}
+
+.audit-row strong {
+  color: #f8fafc;
+  font-weight: 600;
+  text-align: right;
+}
+
+.audit-ok {
+  color: #34f59b !important;
+}
+
+.audit-pending {
+  color: #ffbe0b !important;
+}
+
+.audit-fail {
+  color: #ff4d6d !important;
+}
+
+.audit-legend {
+  margin-top: 3px;
+  padding-top: 4px;
+  border-top: 1px solid rgba(75, 227, 255, 0.2);
+  color: #94a3b8;
+  font-size: 0.68rem;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.dot-cyan,
+.dot-green {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+}
+
+.dot-cyan {
+  background: #4be3ff;
+}
+
+.dot-green {
+  background: #34f59b;
+}
+
 /* Modal Drawer */
 .drawer-backdrop {
   position: fixed;

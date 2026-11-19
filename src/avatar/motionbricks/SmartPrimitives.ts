@@ -1,4 +1,9 @@
 import {
+  adaptSomaSitWindowToSurface,
+  AvatarBodyProfile,
+  WorldContactSurface,
+} from './ContactContract';
+import {
   MB_FPS,
   placeTarget,
   quatRotateVec,
@@ -90,14 +95,17 @@ export function quickenSteps(
 
 /**
  * Builds an authentic MotionBricks `ardy_sit` Smart Primitive plan (`Sit`: ToSit -> Sit,
- * and `Stand`: ToStand) anchored onto a target chair or bed surface in world space.
+ * and `Stand`: ToStand) anchored onto a live target surface in world space.
+ * When `surface` and `profile` are supplied, the SOMA target window's seated pelvis height
+ * is adapted directly to the live seat surface + avatar seated support underside offset.
  */
 export function buildSitPrimitive(
   sk: SomaSkeleton,
   ardyData: ArdyRuntimeData,
   seatWorldPos: [number, number, number],
   seatYaw: number,
-  standWorldPos?: [number, number, number]
+  standWorldPos?: [number, number, number],
+  adaptation?: {surface: WorldContactSurface; profile: AvatarBodyProfile}
 ): PrimitiveSequencePlan {
   const sitPrim = ardyData.prims.find((p) => p.name === 'ardy_sit');
   if (!sitPrim) {
@@ -110,16 +118,27 @@ export function buildSitPrimitive(
     throw new Error('ardy_sit missing Sit or Stand sequence');
   }
 
+  const standOffset = adaptation
+    ? Math.max(0.32, adaptation.surface.approachStandOff)
+    : 0.42;
   const effectiveStandPos: [number, number, number] = standWorldPos ?? [
-    seatWorldPos[0] + Math.sin(seatYaw) * 0.42,
+    seatWorldPos[0] + Math.sin(seatYaw) * standOffset,
     0,
-    seatWorldPos[2] + Math.cos(seatYaw) * 0.42,
+    seatWorldPos[2] + Math.cos(seatYaw) * standOffset,
   ];
 
   const sitSteps: ScheduledMotionStep[] = sitSeq.steps.map((step, idx) => {
     const isFinalSit = step.node === 'Sit' || idx === sitSeq.steps.length - 1;
     // Keep targetWindow in local +Z frame because `avatarAnchor.rotation.y` applies `seatYaw`
-    const placed = placeTarget(sk, step.window, [0, 0, 0], 0);
+    let placed = placeTarget(sk, step.window, [0, 0, 0], 0);
+    if (isFinalSit && adaptation) {
+      placed = adaptSomaSitWindowToSurface(
+        placed,
+        sk,
+        adaptation.surface,
+        adaptation.profile
+      );
+    }
     return {
       node: step.node,
       durationSec: isFinalSit
@@ -153,22 +172,29 @@ export function buildSitPrimitive(
 
 /**
  * Places an ARDY interaction action (`kick`, `pickup`, `push`) so its measured SOMA
- * contact vector `[cx, cy, cz]` lands directly at `propWorldPos` when approaching from
- * `avatarWorldPos`.
+ * contact vector `[cx, cy, cz]` (scaled by avatar retargetScale) aims directly at
+ * `propWorldPos` when approaching from `avatarWorldPos`.
  */
 export function placeArdyAction(
   sk: SomaSkeleton,
   ardyData: ArdyRuntimeData,
   actionName: 'kick' | 'pickup' | 'push',
   propWorldPos: [number, number, number],
-  avatarWorldPos: [number, number, number]
+  avatarWorldPos: [number, number, number],
+  retargetScale = 1.0
 ): ActionSequencePlan {
   const act = ardyData.actions[actionName];
   if (!act || !act.steps || act.steps.length === 0) {
     throw new Error(`Missing ARDY action "${actionName}" in ardy_runtime.json`);
   }
 
-  const contact = act.contact ?? [0, 0.35, 0.4];
+  const rawContact = act.contact ?? [0, 0.35, 0.4];
+  const scale = Math.max(0.5, retargetScale);
+  const contact: [number, number, number] = [
+    rawContact[0] * scale,
+    rawContact[1] * scale,
+    rawContact[2] * scale,
+  ];
   let dx = propWorldPos[0] - avatarWorldPos[0];
   let dz = propWorldPos[2] - avatarWorldPos[2];
   const dist = Math.hypot(dx, dz);
@@ -180,7 +206,7 @@ export function placeArdyAction(
     dz /= dist;
   }
 
-  // Compensate for lateral contact offset (e.g. kick uses right foot cx = -0.35m)
+  // Compensate for lateral contact offset (e.g. kick uses right foot cx = -0.35m * scale)
   const approachYaw = Math.atan2(dx, dz);
   const rotContact = quatRotateVec(quatYaw(approachYaw), contact);
   const anchorX = propWorldPos[0] - rotContact[0];
@@ -198,7 +224,7 @@ export function placeArdyAction(
     };
   });
 
-  // Contact triggers right as the first action step reaches peak contact before Follow/Rise
+  // Reference peak timing metadata (never used to bypass final-pose contact verification)
   const contactDelaySec = Math.max(0.24, steps[0].durationSec * 0.72);
 
   return {

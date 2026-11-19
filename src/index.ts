@@ -67,21 +67,14 @@ class NeuroAppController extends xb.Script {
   private affinity = 75;
   private currentEmotion = AvatarEmotion.NEUTRAL;
   private currentGesture = AvatarGesture.IDLE;
-  private messages: ChatMessage[] = [
-    {
-      id: 'init-1',
-      role: 'assistant',
-      content: '...',
-      emotion: AvatarEmotion.NEUTRAL,
-      gesture: AvatarGesture.IDLE,
-      timestamp: Date.now(),
-    },
-  ];
+  private messages: ChatMessage[] = [];
 
   private scene!: NeuroAvatarScene;
   private hud!: AnimeHudController;
   private voice!: VoiceManager;
   private hudLoopActive = false;
+  private chatTurnInFlight = false;
+  private actionReactionSeq = 0;
   private serverHealthPromise: Promise<void> | null = null;
   private serverDefaults: {baseUrl: string; model: string} = {
     baseUrl: DEFAULT_OPENAI_CONFIG.baseUrl,
@@ -102,28 +95,34 @@ class NeuroAppController extends xb.Script {
         }
       },
       onError: (err) => {
-        this.pushAssistantMessage(`(Voice) ${err}`, AvatarEmotion.SURPRISED);
+        this.pushSystemNotice(`[Voice] ${err}`);
       },
     });
 
     this.scene = new NeuroAvatarScene(this.isSoftwareGl, {
-      onAvatarPoke: () => {
+      onAvatarPoke: (situation) => {
         this.affinity = Math.min(100, this.affinity + 2);
         this.setAvatarExpression(AvatarEmotion.TSUNDERE, AvatarGesture.SHY_FIDGET);
-        const line = 'H-hey! 손잡고 데리고 다닐 거면 먼저 말해줘야지~!';
-        this.pushAssistantMessage(line, AvatarEmotion.TSUNDERE, AvatarGesture.SHY_FIDGET);
-        this.voice.speak(line);
+        void this.handleSituationReaction(situation);
       },
-      onPropInteracted: (_propId, _pose, reactionText) => {
+      onPropInteracted: (_propId, _pose, situation) => {
         this.affinity = Math.min(100, this.affinity + 1);
-        this.pushAssistantMessage(reactionText, this.currentEmotion, AvatarGesture.IDLE);
         this.syncHudStatus();
+        void this.handleSituationReaction(situation);
       },
       onHandHoldChanged: (active) => {
         this.hud.setHandHoldActive(active);
       },
+      onHandHoldSituation: (situation) => {
+        this.affinity = Math.min(100, this.affinity + 1);
+        this.syncHudStatus();
+        void this.handleSituationReaction(situation);
+      },
       onMotionStateChanged: (snapshot) => {
         this.hud.updateMotionState(snapshot);
+      },
+      onContactAuditChanged: (audit) => {
+        this.hud.updateContactAudit(audit);
       },
       onHoverHintChanged: (hint) => {
         this.hud.setHoverHint(hint);
@@ -138,17 +137,20 @@ class NeuroAppController extends xb.Script {
         else if (actionId === 'cycle_stage') this.cycleStageTheme();
       },
       onXRModeChanged: (inXR) => {
-        this.hud.setVisible(!inXR);
+        this.hud.setVisible(!inXR && Boolean(xb.core.simulatorRunning));
       },
       onVrmLoaded: (info) => {
         this.hud.updateVrmInfo(info);
       },
       onVrmError: (err) => {
         this.hud.setVrmError(err);
-        this.pushAssistantMessage(`VRM load failed: ${err}`, AvatarEmotion.SURPRISED);
+        this.pushSystemNotice(`VRM load failed: ${err}`);
       },
       onVRStatusChanged: (status) => {
         this.hud.updateVRStatus(status);
+        if (status.error) {
+          this.pushSystemNotice(status.message);
+        }
       },
     });
     this.add(this.scene);
@@ -180,6 +182,13 @@ class NeuroAppController extends xb.Script {
           this.scene.setSkeletonVisible(!this.scene.skeletonVisible);
           this.syncHudStatus();
         },
+        onToggleContactDebug: () => {
+          const next = !this.scene.contactDebugVisible;
+          this.scene.setContactDebugVisible(next);
+          this.hud.setContactDebugVisible(next);
+          this.hud.updateContactAudit(this.scene.getContactAudit());
+          this.syncHudStatus();
+        },
         onToggleSpatialCards: () => {
           this.scene.setSpatialCardsVisible(!this.scene.spatialCardsEnabled);
           this.syncHudStatus();
@@ -191,33 +200,22 @@ class NeuroAppController extends xb.Script {
           this.scene.interactWithProp(propId);
         },
         onToggleHandHold: () => {
-          const active = this.scene.togglePinnedHandHoldMode();
-          if (active) {
-            this.pushAssistantMessage(
-              '손 잡았어! 마우스나 컨트롤러를 움직이면 방 안을 같이 따라갈게~',
-              AvatarEmotion.LOVE,
-              AvatarGesture.IDLE
-            );
-          }
+          this.scene.togglePinnedHandHoldMode();
         },
         onEnterImmersiveVR: () => this.scene.handleXRButtonClick(),
         onLoadVrmUrl: async (url) => {
           const info = await this.scene.loadVrmFromUrl(url);
           this.setAvatarExpression(AvatarEmotion.NEUTRAL, AvatarGesture.IDLE);
-          this.pushAssistantMessage(
-            `Switched to VRM avatar "${info.name}" (${info.specVersion})!`,
-            AvatarEmotion.NEUTRAL,
-            AvatarGesture.IDLE
+          this.pushSystemNotice(
+            `VRM loaded: "${info.name}" (${info.specVersion})`
           );
           return info;
         },
         onLoadVrmFile: async (file) => {
           const info = await this.scene.loadVrmFromFile(file);
           this.setAvatarExpression(AvatarEmotion.NEUTRAL, AvatarGesture.IDLE);
-          this.pushAssistantMessage(
-            `Loaded your local VRM "${info.name}" (${info.specVersion})!`,
-            AvatarEmotion.NEUTRAL,
-            AvatarGesture.IDLE
+          this.pushSystemNotice(
+            `Local VRM loaded: "${info.name}" (${info.specVersion})`
           );
           return info;
         },
@@ -225,10 +223,8 @@ class NeuroAppController extends xb.Script {
           const info = await this.scene.resetDefaultVrm();
           if (info) {
             this.setAvatarExpression(AvatarEmotion.NEUTRAL, AvatarGesture.IDLE);
-            this.pushAssistantMessage(
-              `Reset to default VRM avatar "${info.name}" (${info.specVersion})!`,
-              AvatarEmotion.NEUTRAL,
-              AvatarGesture.IDLE
+            this.pushSystemNotice(
+              `Default VRM restored: "${info.name}" (${info.specVersion})`
             );
           }
           return info;
@@ -256,6 +252,7 @@ class NeuroAppController extends xb.Script {
   }
 
   private async runStartupGreeting(): Promise<void> {
+    this.pushSystemNotice('LLM 연결 확인 중...');
     if (this.serverHealthPromise) {
       await this.serverHealthPromise;
     }
@@ -264,12 +261,18 @@ class NeuroAppController extends xb.Script {
         config: this.openAIConfig,
         ctx: this.buildPluginContext(),
       });
+      if (!result) {
+        this.pushSystemNotice(
+          'LLM API가 연결되지 않았습니다. Model API 또는 Secrets를 설정하면 아바타 대화가 활성화됩니다.'
+        );
+        return;
+      }
       this.currentEmotion = result.emotion;
       this.currentGesture = result.gesture;
       this.syncHudStatus();
 
       const greetingMsg: ChatMessage = {
-        id: 'init-1',
+        id: `a-${Date.now()}`,
         role: 'assistant',
         content: result.reply,
         emotion: result.emotion,
@@ -280,8 +283,9 @@ class NeuroAppController extends xb.Script {
       this.messages = [greetingMsg];
       this.hud.updateDialogue(greetingMsg, this.messages);
       this.scene.setDialogueSubtitle(result.reply);
-    } catch {
-      // Keep simple greeting if startup greeting encounters an unexpected failure
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      this.pushSystemNotice(`LLM 시작 인사 실패: ${msg}`);
     }
   }
 
@@ -353,8 +357,13 @@ class NeuroAppController extends xb.Script {
   }
 
   onXRSessionEnded(): void {
-    document.body.dataset.state = 'active';
-    this.hud.setVisible(true);
+    if (xb.core.simulatorRunning) {
+      document.body.dataset.state = 'active';
+      this.hud.setVisible(true);
+    } else {
+      delete document.body.dataset.state;
+      this.hud.setVisible(false);
+    }
   }
 
   private handlePointerMove = (e: PointerEvent): void => {
@@ -378,10 +387,9 @@ class NeuroAppController extends xb.Script {
     void this.scene
       .loadVrmFromFile(file)
       .then((info) => {
-        this.pushAssistantMessage(
-          `Dropped VRM "${info.name}" (${info.specVersion}) onto the stage!`,
-          AvatarEmotion.HAPPY,
-          AvatarGesture.WAVE
+        this.setAvatarExpression(AvatarEmotion.NEUTRAL, AvatarGesture.IDLE);
+        this.pushSystemNotice(
+          `VRM loaded via drag-and-drop: "${info.name}" (${info.specVersion})`
         );
       })
       .catch((err) => {
@@ -412,6 +420,7 @@ class NeuroAppController extends xb.Script {
       gesture: this.currentGesture,
       affinity: this.affinity,
       skeletonVisible: this.scene.skeletonVisible,
+      contactDebugVisible: this.scene.contactDebugVisible,
       spatialVisible: this.scene.spatialCardsEnabled,
       stageTheme: this.scene.stageTheme,
     });
@@ -484,10 +493,50 @@ class NeuroAppController extends xb.Script {
     };
   }
 
+  private async handleSituationReaction(situation: string): Promise<void> {
+    // If the user's chat turn triggered this room action via a tool call,
+    // the chat turn itself will produce the spoken reply.
+    if (this.chatTurnInFlight) return;
+    if (this.serverHealthPromise) {
+      await this.serverHealthPromise;
+    }
+    if (this.chatTurnInFlight) return;
+
+    const seq = ++this.actionReactionSeq;
+    try {
+      const result = await this.aiClient.generateActionReaction({
+        situation,
+        history: this.messages,
+        config: this.openAIConfig,
+        ctx: this.buildPluginContext(),
+      });
+      if (!result || seq !== this.actionReactionSeq || this.chatTurnInFlight) {
+        return;
+      }
+
+      this.currentEmotion = result.emotion;
+      this.syncHudStatus();
+      this.pushAssistantMessage(
+        result.reply,
+        result.emotion,
+        AvatarGesture.IDLE,
+        result.pluginLogs
+      );
+      this.voice.speak(result.reply);
+    } catch (error) {
+      if (seq !== this.actionReactionSeq || this.chatTurnInFlight) return;
+      const msg = error instanceof Error ? error.message : String(error);
+      this.pushSystemNotice(`LLM 반응 생성 실패: ${msg}`);
+    }
+  }
+
   async handleUserMessage(userText: string): Promise<void> {
     if (this.serverHealthPromise) {
       await this.serverHealthPromise;
     }
+
+    this.actionReactionSeq++;
+    this.chatTurnInFlight = true;
 
     const userMsg: ChatMessage = {
       id: `u-${Date.now()}`,
@@ -532,22 +581,25 @@ class NeuroAppController extends xb.Script {
           rawErr
         );
       const safeMsg = looksHtmlOrParse
-        ? 'API 서버가 JSON 대신 HTML 페이지를 반환했어! Model API 설정에서 Base URL(예: /v1 포함)과 API 키를 확인해줘.'
+        ? 'API 서버가 JSON 대신 HTML 페이지를 반환했습니다. Model API 설정에서 Base URL(예: /v1 포함)과 API 키를 확인하세요.'
         : rawErr;
-      this.pushAssistantMessage(
-        safeMsg,
-        AvatarEmotion.SURPRISED,
-        AvatarGesture.SHAKE_HEAD
-      );
+      this.pushSystemNotice(safeMsg);
     } finally {
+      this.chatTurnInFlight = false;
       this.hud.setBusy(false);
     }
+  }
+
+  private pushSystemNotice(text: string): void {
+    this.hud.showSystemNotice(text);
+    this.scene.setDialogueSubtitle(`[System] ${text}`);
   }
 
   private pushAssistantMessage(
     content: string,
     emotion = AvatarEmotion.NEUTRAL,
-    gesture = AvatarGesture.IDLE
+    gesture = AvatarGesture.IDLE,
+    pluginCalls?: ChatMessage['pluginCalls']
   ): void {
     const msg: ChatMessage = {
       id: `a-${Date.now()}`,
@@ -555,6 +607,7 @@ class NeuroAppController extends xb.Script {
       content,
       emotion,
       gesture,
+      pluginCalls,
       timestamp: Date.now(),
     };
     this.messages.push(msg);
@@ -634,19 +687,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
   const appController = new NeuroAppController(isSoftwareGl);
   xb.add(appController);
-  void xb.init(options).then(() => {
-    // Wire landing XRButton click handler for immersive VR scene setup
-    const landingXrBtn = xb.core.xrButton?.xrButtonElement;
-    if (landingXrBtn) {
-      landingXrBtn.addEventListener('click', () => {
-        const sceneScript = appController.children.find(
-          (c): c is NeuroAvatarScene => c instanceof NeuroAvatarScene
-        );
-        if (!xb.core.webXRSessionManager?.isXRSupported()) {
-          void xb.core.xrButton?.startSimulator?.();
-        }
-        void sceneScript?.handleXRButtonClick();
-      });
-    }
-  });
+  // Single WebXR session path: landing XRButton delegates directly to XR Blocks'
+  // built-in WebXRSessionManager (no duplicate app-level click listener!).
+  void xb.init(options);
 });

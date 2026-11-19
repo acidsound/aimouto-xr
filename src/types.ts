@@ -74,6 +74,16 @@ export interface MotionBrickSnapshot {
   weightKg?: number;
   verticalVelocity?: number;
   motionBackend?: 'onnx_webgpu' | 'soma_runtime';
+  frameSource?: 'motionbricks_onnx' | 'motionbricks_soma' | 'fallback_procedural';
+  contactStatus?:
+    | 'idle'
+    | 'approaching'
+    | 'executing'
+    | 'contact_verified'
+    | 'sustained_contact'
+    | 'failed';
+  contactGapMm?: number;
+  contactFailureReason?: string;
 }
 
 export interface OpenAICompatConfig {
@@ -83,7 +93,6 @@ export interface OpenAICompatConfig {
   systemPrompt: string;
   temperature: number;
   useProxy: boolean;
-  demoFallbackEnabled: boolean;
   customEndpoint?: boolean;
 }
 

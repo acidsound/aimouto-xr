@@ -20,6 +20,10 @@ import {
   placeArdyAction,
 } from './motionbricks/SmartPrimitives';
 import {MotionBricksEngine} from './MotionBricksEngine';
+import {
+  DEFAULT_CONTACT_CONTRACTS,
+  PropContactSurfaceLocal,
+} from './motionbricks/ContactContract';
 
 const ROOT_DIR = process.cwd();
 const SOMA_DATA = JSON.parse(
@@ -28,6 +32,51 @@ const SOMA_DATA = JSON.parse(
 const ARDY_DATA = JSON.parse(
   fs.readFileSync(path.join(ROOT_DIR, 'public/motionbricks/ardy_runtime.json'), 'utf8')
 ) as ArdyRuntimeData;
+
+function createHierarchicalMockVrm(anchor: THREE.Group, scale = 1) {
+  const scene = new THREE.Group();
+  scene.scale.setScalar(scale);
+  const bones = new Map<string, THREE.Object3D>();
+  const addBone = (name: string, parent: THREE.Object3D, x: number, y: number, z: number) => {
+    const b = new THREE.Object3D();
+    b.name = name;
+    b.position.set(x, y, z);
+    parent.add(b);
+    bones.set(name, b);
+    return b;
+  };
+  const hips = addBone('hips', scene, 0, 0.86, 0);
+  const spine = addBone('spine', hips, 0, 0.12, 0);
+  const chest = addBone('chest', spine, 0, 0.14, 0);
+  const upperChest = addBone('upperChest', chest, 0, 0.12, 0);
+  const neck = addBone('neck', upperChest, 0, 0.1, 0);
+  addBone('head', neck, 0, 0.08, 0);
+  const lShoulder = addBone('leftShoulder', upperChest, 0.06, 0, 0);
+  const lUpperArm = addBone('leftUpperArm', lShoulder, 0.08, 0, 0);
+  const lLowerArm = addBone('leftLowerArm', lUpperArm, 0.24, 0, 0);
+  addBone('leftHand', lLowerArm, 0.23, 0, 0);
+  const rShoulder = addBone('rightShoulder', upperChest, -0.06, 0, 0);
+  const rUpperArm = addBone('rightUpperArm', rShoulder, -0.08, 0, 0);
+  const rLowerArm = addBone('rightLowerArm', rUpperArm, -0.24, 0, 0);
+  addBone('rightHand', rLowerArm, -0.23, 0, 0);
+  const lUpperLeg = addBone('leftUpperLeg', hips, 0.09, -0.04, 0);
+  const lLowerLeg = addBone('leftLowerLeg', lUpperLeg, 0, -0.38, 0);
+  const lFoot = addBone('leftFoot', lLowerLeg, 0, -0.37, 0);
+  addBone('leftToes', lFoot, 0, -0.04, 0.1);
+  const rUpperLeg = addBone('rightUpperLeg', hips, -0.09, -0.04, 0);
+  const rLowerLeg = addBone('rightLowerLeg', rUpperLeg, 0, -0.38, 0);
+  const rFoot = addBone('rightFoot', rLowerLeg, 0, -0.37, 0);
+  addBone('rightToes', rFoot, 0, -0.04, 0.1);
+
+  anchor.add(scene);
+  return {
+    scene,
+    humanoid: {
+      getNormalizedBoneNode: (n: string) => bones.get(n) ?? null,
+      getRawBoneNode: (n: string) => bones.get(n) ?? null,
+    },
+  };
+}
 
 test('SomaSkeleton loads 77 joints and computes forward kinematics', () => {
   const sk = new SomaSkeleton(SOMA_DATA);
@@ -134,34 +183,77 @@ test('placeArdyAction places kick, pickup, and push with valid contact offsets a
   }
 });
 
-test('MotionBricksEngine executes ardy_sit on desk_chair and contact-timed kick action on toy_ball', () => {
+test('MotionBricksEngine executes ardy_sit on desk_chair and contact-verified kick action on toy_ball', () => {
   const engine = new MotionBricksEngine(false);
   engine.loadRuntimeData(SOMA_DATA, ARDY_DATA);
   assert.equal(engine.hasSomaRuntime, true);
 
-  // Enqueue desk chair right at its approach spot -> activates ardy_sit ToSit immediately
-  engine.rootPosition.set(-0.65, 0, -2.02);
-  engine.enqueueCommand({
+  const anchor = new THREE.Group();
+  const mockVrm = createHierarchicalMockVrm(anchor, 1.0);
+  engine.setVRM(mockVrm as unknown as Parameters<MotionBricksEngine['setVRM']>[0]);
+
+  const chairObj = new THREE.Group();
+  chairObj.position.set(-0.65, 0, -2.02);
+  chairObj.updateMatrixWorld(true);
+  const chairSurface: PropContactSurfaceLocal = {
+    shape: 'box',
+    localCenter: [0, 0.44, 0],
+    localHalfExtents: [0.22, 0.03, 0.22],
+    localNormal: [0, 1, 0],
+    localApproachDir: [1, 0, 0],
+    localFacingDir: [-1, 0, 0],
+    approachStandOff: 0.36,
+  };
+
+  // Start near chair approach spot -> activates ardy_sit ToSit immediately
+  engine.rootPosition.set(-0.29, 0, -2.02);
+  let sitVerified = 0;
+  engine.executeCommand({
     propId: 'desk_chair',
     pose: 'sit_desk',
-    approachPos: new THREE.Vector3(-0.65, 0, -2.02),
-    approachYaw: -Math.PI / 2,
+    surfaceObject: chairObj,
+    contactSurface: chairSurface,
+    contract: DEFAULT_CONTACT_CONTRACTS.desk_chair,
+    onContactVerified: () => {
+      sitVerified++;
+    },
   });
 
-  const anchor = new THREE.Group();
-  engine.update(0.016, 0.016, anchor);
+  // Step through approach + ToSit -> Sit verified sustained contact
+  let sawToSit = false;
+  for (let i = 0; i < 180; i++) {
+    engine.update(1 / 60, (i + 1) / 60, anchor);
+    if (engine.activeSomaSequenceNode === 'ToSit') sawToSit = true;
+  }
+  assert.equal(sawToSit, true, 'Expected ardy_sit ToSit transition node');
   assert.equal(engine.pose, 'sit_desk');
-  assert.equal(engine.activeSomaSequenceNode, 'ToSit');
+  assert.equal(sitVerified, 1, 'Expected chair sit contact to be verified');
+  assert.equal(engine.getContactAudit().status, 'sustained_contact');
+  assert.equal(engine.getContactAudit().frameSource, 'motionbricks_soma');
 
-  // Execute kick action against toy_ball near the avatar -> must stand first via ToStand, then kick and fire onContact
+  // Execute kick action against toy_ball near the avatar -> must stand first via ToStand, then kick and verify contact
+  const ballObj = new THREE.Group();
+  ballObj.position.set(-0.25, 0.14, -1.55);
+  ballObj.updateMatrixWorld(true);
+  const ballSurface: PropContactSurfaceLocal = {
+    shape: 'sphere',
+    localCenter: [0, 0, 0],
+    localHalfExtents: [0.14, 0.14, 0.14],
+    localNormal: [0, 0, 1],
+    localApproachDir: [0, 0, -1],
+    localFacingDir: [0, 0, 1],
+    approachStandOff: 0.42,
+  };
+
   let contactCount = 0;
   let completedCount = 0;
-  engine.executePropAction({
+  engine.executeCommand({
     propId: 'toy_ball',
     pose: 'kick_ball',
-    actionName: 'kick',
-    propWorldPos: new THREE.Vector3(-0.62, 0.14, -1.75),
-    onContact: () => {
+    surfaceObject: ballObj,
+    contactSurface: ballSurface,
+    contract: DEFAULT_CONTACT_CONTRACTS.toy_ball,
+    onContactVerified: () => {
       contactCount++;
     },
     onComplete: () => {
@@ -172,12 +264,75 @@ test('MotionBricksEngine executes ardy_sit on desk_chair and contact-timed kick 
   // Should transition via Stand first since avatar was seated!
   assert.equal(engine.activeSomaSequenceNode, 'ToStand');
 
-  // Step time forward ~6 seconds to complete stand -> walk -> kick + follow
-  for (let i = 0; i < 360; i++) {
-    engine.update(1 / 60, (i + 1) / 60, anchor);
+  // Step time forward ~7 seconds to complete stand -> walk -> kick + follow
+  for (let i = 0; i < 420; i++) {
+    engine.update(1 / 60, (181 + i) / 60, anchor);
   }
 
-  assert.equal(contactCount, 1, 'Expected kick onContact callback to fire exactly once');
+  assert.equal(contactCount, 1, 'Expected kick onContactVerified callback to fire exactly once');
   assert.equal(completedCount, 1, 'Expected kick sequence to complete cleanly');
   assert.equal(engine.pose, 'idle');
+  assert.equal(engine.getContactAudit().frameSource, 'motionbricks_soma');
+});
+
+test('MotionBricksEngine alternates left and right legs (no single-foot sliding) when walking with SOMA runtime loaded', () => {
+  const engine = new MotionBricksEngine(false);
+  engine.loadRuntimeData(SOMA_DATA, ARDY_DATA);
+
+  // Create a minimal mock VRM humanoid with normalized bones to observe real bone rotations
+  const boneMap = new Map<string, THREE.Object3D>();
+  for (const name of [
+    'hips',
+    'spine',
+    'chest',
+    'leftUpperLeg',
+    'rightUpperLeg',
+    'leftLowerLeg',
+    'rightLowerLeg',
+    'leftFoot',
+    'rightFoot',
+    'leftUpperArm',
+    'rightUpperArm',
+    'leftLowerArm',
+    'rightLowerArm',
+  ]) {
+    boneMap.set(name, new THREE.Object3D());
+  }
+  const mockVrm = {
+    scene: new THREE.Group(),
+    humanoid: {
+      getNormalizedBoneNode: (n: string) => boneMap.get(n) ?? null,
+    },
+  };
+  engine.setVRM(mockVrm as unknown as Parameters<MotionBricksEngine['setVRM']>[0]);
+
+  engine.rootPosition.set(-1.1, 0, -1.2);
+  engine.walkToFloor(1.1, -1.2, 0);
+
+  const anchor = new THREE.Group();
+  let minLeftX = Infinity;
+  let maxLeftX = -Infinity;
+  let minRightX = Infinity;
+  let maxRightX = -Infinity;
+  let oppositeSignFrames = 0;
+
+  const eulerL = new THREE.Euler();
+  const eulerR = new THREE.Euler();
+  for (let i = 0; i < 120; i++) {
+    engine.update(1 / 60, (i + 1) / 60, anchor);
+    eulerL.setFromQuaternion(boneMap.get('leftUpperLeg')!.quaternion, 'XYZ');
+    eulerR.setFromQuaternion(boneMap.get('rightUpperLeg')!.quaternion, 'XYZ');
+    minLeftX = Math.min(minLeftX, eulerL.x);
+    maxLeftX = Math.max(maxLeftX, eulerL.x);
+    minRightX = Math.min(minRightX, eulerR.x);
+    maxRightX = Math.max(maxRightX, eulerR.x);
+    if (eulerL.x * eulerR.x < -0.02) {
+      oppositeSignFrames++;
+    }
+  }
+
+  // Both legs must sweep significantly forward (< -0.25) AND backward (> +0.20)
+  assert.ok(minLeftX < -0.25 && maxLeftX > 0.2, `Left leg did not alternate: [${minLeftX}, ${maxLeftX}]`);
+  assert.ok(minRightX < -0.25 && maxRightX > 0.2, `Right leg did not alternate: [${minRightX}, ${maxRightX}]`);
+  assert.ok(oppositeSignFrames > 30, `Expected legs to cross in opposite directions, got ${oppositeSignFrames} frames`);
 });

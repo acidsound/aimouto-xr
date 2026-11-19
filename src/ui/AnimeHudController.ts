@@ -7,6 +7,7 @@ import {
   GESTURE_LABELS,
   STAGE_THEMES,
 } from '../constants';
+import {ContactAuditSnapshot} from '../avatar/motionbricks/ContactContract';
 import {SceneHoverHint} from '../scene/NeuroAvatarScene';
 import {VRSessionStatus} from '../scene/vrSessionController';
 import {
@@ -34,6 +35,7 @@ export interface HudActions {
   onSelectGesture: (gesture: AvatarGesture) => void;
   onSelectStageTheme: (theme: StageThemeId) => void;
   onToggleSkeleton: () => void;
+  onToggleContactDebug: () => void;
   onToggleSpatialCards: () => void;
   onToggleXRPassMode: () => void;
   onTriggerRoomProp: (propId: RoomPropId) => void;
@@ -78,6 +80,7 @@ export class AnimeHudController {
   private ttsStatusBadgeEl!: HTMLSpanElement;
   private langBtnEl!: HTMLButtonElement;
   private rigToggleBtnEl!: HTMLButtonElement;
+  private contactDebugBtnEl!: HTMLButtonElement;
   private spatialToggleBtnEl!: HTMLButtonElement;
   private handHoldBtnEl!: HTMLButtonElement;
   private hoverHintEl!: HTMLDivElement;
@@ -85,6 +88,8 @@ export class AnimeHudController {
   private rigTagEl!: HTMLSpanElement;
   private xrLaunchBtnEl!: HTMLButtonElement;
   private physicsStatusEl!: HTMLDivElement;
+  private contactAuditEl!: HTMLDivElement;
+  private contactDebugVisible = false;
 
   private drawerBackdropEl!: HTMLDivElement;
   private drawerBodyEl!: HTMLDivElement;
@@ -298,6 +303,7 @@ export class AnimeHudController {
             <button type="button" class="chip-btn" data-action="toggle_lang" data-testid="lang-btn">KR / EN</button>
             <button type="button" class="chip-btn" data-action="toggle_tts" data-testid="tts-btn">Voice ON</button>
             <button type="button" class="chip-btn" data-action="toggle_rig" data-testid="rig-btn">Bones</button>
+            <button type="button" class="chip-btn" data-action="toggle_contact_debug" data-testid="contact-debug-btn">Contact</button>
             <button type="button" class="chip-btn" data-action="toggle_history" data-testid="history-btn">Logs</button>
           </div>
         </div>
@@ -305,6 +311,9 @@ export class AnimeHudController {
 
       <!-- World Hover Prompt Pill -->
       <div class="room-hover-hint" style="display: none"></div>
+
+      <!-- Contact-Contract Debug Popover (hidden unless Contact debug toggled) -->
+      <div class="anime-card contact-audit-popover" data-testid="contact-audit-panel" style="display: none" aria-label="Contact Contract Debug"></div>
 
       <!-- Collapsible Chat History Log (hidden by default) -->
       <div class="anime-card chat-history-popover" style="display: none" aria-label="Chat History"></div>
@@ -359,6 +368,7 @@ export class AnimeHudController {
     this.ttsStatusBadgeEl = this.root.querySelector('[data-action="toggle_tts"]')!;
     this.langBtnEl = this.root.querySelector('[data-action="toggle_lang"]')!;
     this.rigToggleBtnEl = this.root.querySelector('[data-action="toggle_rig"]')!;
+    this.contactDebugBtnEl = this.root.querySelector('[data-action="toggle_contact_debug"]')!;
     this.spatialToggleBtnEl = this.root.querySelector('[data-action="toggle_spatial"]')!;
     this.handHoldBtnEl = this.root.querySelector('[data-action="toggle_hand_hold"]')!;
     this.hoverHintEl = this.root.querySelector('.room-hover-hint')!;
@@ -366,6 +376,7 @@ export class AnimeHudController {
     this.rigTagEl = this.root.querySelector('.rig-tag')!;
     this.xrLaunchBtnEl = this.root.querySelector('[data-action="enter_vr"]')!;
     this.physicsStatusEl = this.root.querySelector('[data-testid="physics-status"]')!;
+    this.contactAuditEl = this.root.querySelector('.contact-audit-popover')!;
     this.historyPanelEl = this.root.querySelector('.chat-history-popover')!;
     this.drawerBackdropEl = this.root.querySelector('.drawer-backdrop')!;
     this.drawerTitleEl = this.root.querySelector('.drawer-title')!;
@@ -419,6 +430,9 @@ export class AnimeHudController {
           break;
         case 'toggle_rig':
           this.actions.onToggleSkeleton();
+          break;
+        case 'toggle_contact_debug':
+          this.actions.onToggleContactDebug();
           break;
         case 'toggle_spatial':
           this.actions.onToggleSpatialCards();
@@ -501,6 +515,7 @@ export class AnimeHudController {
     gesture: AvatarGesture;
     affinity: number;
     skeletonVisible: boolean;
+    contactDebugVisible?: boolean;
     spatialVisible: boolean;
     stageTheme: StageThemeId;
   }): void {
@@ -517,7 +532,48 @@ export class AnimeHudController {
     this.affinityFillEl.style.width = `${opts.affinity}%`;
     this.affinityTextEl.textContent = `${opts.affinity}%`;
     this.rigToggleBtnEl.classList.toggle('is-active', opts.skeletonVisible);
+    if (opts.contactDebugVisible !== undefined) {
+      this.contactDebugBtnEl.classList.toggle('is-active', opts.contactDebugVisible);
+    }
     this.spatialToggleBtnEl.classList.toggle('is-active', opts.spatialVisible);
+  }
+
+  setContactDebugVisible(visible: boolean): void {
+    this.contactDebugVisible = visible;
+    this.contactDebugBtnEl.classList.toggle('is-active', visible);
+    this.contactAuditEl.style.display = visible ? 'flex' : 'none';
+  }
+
+  updateContactAudit(audit: ContactAuditSnapshot): void {
+    if (!this.contactDebugVisible) return;
+    const srcLabel =
+      audit.frameSource === 'motionbricks_onnx'
+        ? 'MotionBricks ONNX'
+        : audit.frameSource === 'motionbricks_soma'
+          ? 'MotionBricks SOMA'
+          : 'Fallback Procedural';
+    const ver = audit.verification;
+    const gapStr = ver ? `${(ver.gapMeters * 1000).toFixed(1)}mm` : '—';
+    const penStr = ver ? `${(ver.penetrationMeters * 1000).toFixed(1)}mm` : '—';
+    const corrStr = ver ? `${(ver.correctionAppliedMeters * 1000).toFixed(1)}mm` : '—';
+    const alignStr = ver ? ver.normalAlignment.toFixed(2) : '—';
+    const statusClass =
+      audit.status === 'failed'
+        ? 'audit-fail'
+        : audit.status === 'contact_verified' || audit.status === 'sustained_contact'
+          ? 'audit-ok'
+          : 'audit-pending';
+
+    this.contactAuditEl.innerHTML = `
+      <div class="history-header">Contact Contract Debug</div>
+      <div class="audit-row"><span>Target</span><strong>${this.escapeHtml(audit.propId ?? 'none')} (${this.escapeHtml(audit.contractKind ?? '—')})</strong></div>
+      <div class="audit-row"><span>Body Region</span><strong>${this.escapeHtml(audit.bodyRegionId ?? '—')}</strong></div>
+      <div class="audit-row"><span>Status</span><strong class="${statusClass}">${this.escapeHtml(audit.status)}${audit.failureReason !== 'none' ? ` [${this.escapeHtml(audit.failureReason)}]` : ''}</strong></div>
+      <div class="audit-row"><span>Frame Source</span><strong>${this.escapeHtml(srcLabel)}</strong></div>
+      <div class="audit-row"><span>Gap / Pen / Corr</span><strong>${gapStr} / ${penStr} / ${corrStr}</strong></div>
+      <div class="audit-row"><span>Normal / Replans</span><strong>${alignStr} / ${audit.replanCount} (hold ${audit.sustainedFrames}f)</strong></div>
+      <div class="audit-legend"><span class="dot-cyan"></span>Target Surface &amp; Normal &nbsp;<span class="dot-green"></span>Body Region</div>
+    `;
   }
 
   updateMotionState(snapshot: MotionBrickSnapshot): void {
@@ -527,7 +583,11 @@ export class AnimeHudController {
       const weight = snapshot.weightKg ?? 46;
       const groundLabel = snapshot.grounded === false ? 'Airborne' : 'Grounded';
       const backendLabel =
-        snapshot.motionBackend === 'onnx_webgpu' ? 'SOMA+ONNX' : 'SOMA 77J';
+        snapshot.frameSource === 'motionbricks_onnx'
+          ? 'MB ONNX'
+          : snapshot.frameSource === 'motionbricks_soma'
+            ? 'MB SOMA'
+            : 'Procedural';
       const engineLabel = snapshot.physicsActive ? '60Hz' : 'Kinematic';
       this.physicsStatusEl.textContent = `⚖️ ${weight}kg • ${groundLabel} • ${backendLabel} • ${engineLabel}`;
     }
@@ -566,6 +626,19 @@ export class AnimeHudController {
     if (this.historyVisible) {
       this.renderHistory();
     }
+  }
+
+  /**
+   * Displays a non-avatar system status/error message in the HUD without
+   * recording it as AIMouto's spoken dialogue in the LLM conversation history.
+   */
+  showSystemNotice(text: string): void {
+    this.subtitleEl.textContent = text;
+    this.pluginLogChipRow.innerHTML = '';
+    const chip = document.createElement('span');
+    chip.className = 'plugin-exec-chip';
+    chip.textContent = '⚙ SYSTEM';
+    this.pluginLogChipRow.appendChild(chip);
   }
 
   private renderHistory(): void {
@@ -611,7 +684,7 @@ export class AnimeHudController {
     this.xrLaunchBtnEl.innerHTML = this.vrModeActive
       ? '<span class="btn-glyph">🥽</span><span>Exit VR</span>'
       : '<span class="btn-glyph">🥽</span><span>Enter VR</span>';
-    this.subtitleEl.textContent = status.message;
+    this.showSystemNotice(status.message);
   }
 
   updateVrmInfo(info: LoadedVrmInfo): void {
@@ -878,7 +951,7 @@ export class AnimeHudController {
   private renderModelDrawer(): void {
     const keyStatusBanner = this.serverHasOpenAIKey
       ? `✅ Server Secret Active (${this.serverDefaultBaseUrl} • ${this.serverDefaultModel}).`
-      : 'ℹ️ No server key detected in Settings > Secrets. Using Local Ollama/LM Studio or offline AIMouto Persona Fallback. To use OpenAI / OpenRouter / custom OpenAI-compatible providers, configure Secrets.';
+      : 'ℹ️ No server key detected in Settings > Secrets. Configure OPENAI_COMPAT_API_KEY in Secrets or point Base URL to a local Ollama/LM Studio server so the LLM can generate avatar dialogue.';
 
     this.drawerBodyEl.innerHTML = `
       <div class="art-status-msg">${this.escapeHtml(keyStatusBanner)}</div>
@@ -908,7 +981,6 @@ export class AnimeHudController {
         </label>
         <div class="checkbox-row">
           <label><input type="checkbox" name="useProxy" ${this.openAIConfig.useProxy ? 'checked' : ''} /> Route via /api/chat server proxy (uses server Secret key & avoids CORS)</label>
-          <label><input type="checkbox" name="demoFallbackEnabled" ${this.openAIConfig.demoFallbackEnabled ? 'checked' : ''} /> Offline demo persona only when no API key is configured (never hides real API errors)</label>
         </div>
         <button type="submit" class="primary-btn">Save Model Settings</button>
       </form>
@@ -973,9 +1045,6 @@ export class AnimeHudController {
         temperature: Number(fd.get('temperature') ?? 0.8),
         systemPrompt: String(fd.get('systemPrompt') ?? ''),
         useProxy: (form.querySelector('input[name="useProxy"]') as HTMLInputElement).checked,
-        demoFallbackEnabled: (
-          form.querySelector('input[name="demoFallbackEnabled"]') as HTMLInputElement
-        ).checked,
         customEndpoint: matchesServerDefaults ? false : customEndpointFlag,
       };
       this.openAIConfig = updated;

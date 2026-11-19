@@ -107,7 +107,7 @@ test('PluginRegistry executes built-in move_and_interact_room MotionBricks plugi
   assert.equal(res.result.ok, true);
 });
 
-test('PluginRegistry executes get_current_time and OpenAICompatibleClient produces concise time-tool startup greeting', async () => {
+test('PluginRegistry executes get_current_time and OpenAICompatibleClient generates startup greeting via LLM tool call only', async () => {
   const registry = new PluginRegistry();
   const {ctx} = createStubContext();
   const timeRes = await registry.executeToolCall('get_current_time', {locale: 'ko-KR'}, ctx);
@@ -116,20 +116,75 @@ test('PluginRegistry executes get_current_time and OpenAICompatibleClient produc
   assert.ok(String(timeRes.result.localTime).length > 0);
 
   const client = new OpenAICompatibleClient(registry);
-  const greeting = await client.generateStartupGreeting({
+  // Without an LLM key, startup greeting must NOT return deterministic hardcoded speech
+  const unconfigured = await client.generateStartupGreeting({
     config: {...DEFAULT_OPENAI_CONFIG, baseUrl: 'https://api.openai.com/v1', apiKey: ''},
     ctx,
   });
+  assert.equal(unconfigured, null);
 
-  assert.ok(
-    greeting.pluginLogs.some((log) => log.toolName === 'get_current_time'),
-    'Startup greeting must record get_current_time tool call'
-  );
-  assert.ok(greeting.reply.length > 0 && greeting.reply.length < 90);
-  assert.equal(
-    /플러그인|주사위|VRM|OpenAI|가구를 클릭/.test(greeting.reply),
-    false,
-    'Startup greeting should not explain UI capabilities'
-  );
+  // With server key configured, startup greeting invokes LLM + get_current_time tool
+  client.setServerKeyAvailable(true);
+  let callCount = 0;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () => {
+    callCount++;
+    if (callCount === 1) {
+      return new Response(
+        JSON.stringify({
+          choices: [
+            {
+              message: {
+                role: 'assistant',
+                content: null,
+                tool_calls: [
+                  {
+                    id: 'call_time_1',
+                    type: 'function',
+                    function: {
+                      name: 'get_current_time',
+                      arguments: JSON.stringify({locale: 'ko-KR'}),
+                    },
+                  },
+                ],
+              },
+            },
+          ],
+        }),
+        {status: 200, headers: {'Content-Type': 'application/json'}}
+      );
+    }
+    return new Response(
+      JSON.stringify({
+        choices: [
+          {
+            message: {
+              role: 'assistant',
+              content: '지금 시간 보니까 딱 쉬기 좋은 오후네, 오늘 어때?',
+            },
+          },
+        ],
+      }),
+      {status: 200, headers: {'Content-Type': 'application/json'}}
+    );
+  }) as typeof fetch;
+
+  try {
+    const greeting = await client.generateStartupGreeting({
+      config: {...DEFAULT_OPENAI_CONFIG},
+      ctx,
+    });
+    assert.ok(greeting !== null);
+    assert.ok(
+      greeting.pluginLogs.some((log) => log.toolName === 'get_current_time'),
+      'Startup greeting must record get_current_time tool call'
+    );
+    assert.equal(
+      greeting.reply,
+      '지금 시간 보니까 딱 쉬기 좋은 오후네, 오늘 어때?'
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 

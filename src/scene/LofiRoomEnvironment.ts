@@ -1,4 +1,11 @@
 import * as THREE from 'three';
+import {
+  ContactRelationContract,
+  DEFAULT_CONTACT_CONTRACTS,
+  PropContactSurfaceLocal,
+  resolveWorldContactSurface,
+  WorldContactSurface,
+} from '../avatar/motionbricks/ContactContract';
 import {STAGE_THEMES} from '../constants';
 import {MotionBrickPose, RoomPropId, StageThemeId} from '../types';
 
@@ -13,12 +20,18 @@ export interface RoomObstacle {
 export interface InteractiveRoomProp {
   id: RoomPropId;
   label: string;
-  approachPos: THREE.Vector3;
-  approachYaw: number;
   targetPose: MotionBrickPose;
-  reachTargetWorld: THREE.Vector3;
-  lookAtWorld: THREE.Vector3;
-  hoverAnchorWorld: THREE.Vector3;
+  /** Live Three.js Object3D whose world matrix transforms `contactSurface`. */
+  surfaceObject: THREE.Object3D;
+  /** Contact region and approach/facing vectors in `surfaceObject` local space. */
+  contactSurface: PropContactSurfaceLocal;
+  /** Declarative body-region <-> prop-surface contact contract. */
+  contract: ContactRelationContract;
+  /** Optional secondary prop surface (e.g. laptop keyboard or mug while seated at desk chair). */
+  secondarySurface?: {
+    surfaceObject: THREE.Object3D;
+    contactSurface: PropContactSurfaceLocal;
+  };
   hitMeshes: THREE.Object3D[];
 }
 
@@ -486,6 +499,10 @@ export class LofiRoomEnvironment {
     return this.currentTheme;
   }
 
+  get skyColorHex(): number {
+    return STAGE_THEMES[this.currentTheme].skyColor;
+  }
+
   applyTheme(themeId: StageThemeId, scene?: THREE.Scene): void {
     this.currentTheme = themeId;
     const theme = STAGE_THEMES[themeId];
@@ -544,12 +561,20 @@ export class LofiRoomEnvironment {
     this.interactiveProps.set('floor', {
       id: 'floor',
       label: '👣 여기로 걸어가기 (Walk Here)',
-      approachPos: new THREE.Vector3(-0.08, 0, -1.32),
-      approachYaw: 0,
       targetPose: 'idle',
-      reachTargetWorld: new THREE.Vector3(-0.08, 0, -1.32),
-      lookAtWorld: new THREE.Vector3(0, 1.1, 0),
-      hoverAnchorWorld: new THREE.Vector3(-0.08, 0.05, -1.32),
+      surfaceObject: floor,
+      contactSurface: {
+        shape: 'plane',
+        localCenter: [0, 0.04, 0],
+        localHalfExtents: [1.5, 0.004, 1.4],
+        localNormal: [0, 1, 0],
+        localApproachDir: [0, 0, 1],
+        localFacingDir: [0, 0, 1],
+        approachStandOff: 0,
+        localLookAt: [0, 1.1, 1.6],
+        localHoverAnchor: [0, 0.06, 0],
+      },
+      contract: DEFAULT_CONTACT_CONTRACTS.floor,
       hitMeshes: [floor, rug],
     });
 
@@ -714,13 +739,13 @@ export class LofiRoomEnvironment {
       windowGroup.add(leaf);
     }
 
-    // Exterior Night Skyline Backdrop outside window (x = -2.25)
+    // Exterior Night Skyline Backdrop tucked tightly behind the window cutout so it never peeks outside the left wall when orbiting
     const skyTex = track(createNightSkyTexture());
-    const skyMat = track(new THREE.MeshBasicMaterial({map: skyTex}));
-    const skyBackdrop = new THREE.Mesh(track(new THREE.PlaneGeometry(2.6, 2.2)), skyMat);
+    const skyMat = track(new THREE.MeshBasicMaterial({map: skyTex, side: THREE.FrontSide}));
+    const skyBackdrop = new THREE.Mesh(track(new THREE.PlaneGeometry(1.42, 1.34)), skyMat);
     skyBackdrop.rotation.y = Math.PI / 2;
-    skyBackdrop.position.set(-2.32, 1.42, -1.95);
-    windowGroup.add(skyBackdrop);
+    skyBackdrop.position.set(-1.68, 1.42, -1.95);
+    this.leftWallGroup.add(skyBackdrop);
 
     // Animated falling rain streaks outside window (InstancedMesh)
     const dropCount = 48;
@@ -754,12 +779,20 @@ export class LofiRoomEnvironment {
     this.interactiveProps.set('window', {
       id: 'window',
       label: '🪟 창밖 비 구경하기 (Look Out Window)',
-      approachPos: new THREE.Vector3(-0.94, 0, -1.04),
-      approachYaw: -Math.PI * 0.62,
       targetPose: 'look_window',
-      reachTargetWorld: new THREE.Vector3(-1.38, 0.86, -1.35),
-      lookAtWorld: new THREE.Vector3(-2.1, 1.35, -1.95),
-      hoverAnchorWorld: new THREE.Vector3(-1.42, 1.55, -1.85),
+      surfaceObject: sill,
+      contactSurface: {
+        shape: 'box',
+        localCenter: [0.09, 0.025, 0.56],
+        localHalfExtents: [0.07, 0.035, 0.18],
+        localNormal: [0.85, 0.52, 0],
+        localApproachDir: [0.84, 0, 0.54],
+        localFacingDir: [-0.93, 0, -0.37],
+        approachStandOff: 0.46,
+        localLookAt: [-0.6, 0.55, 0],
+        localHoverAnchor: [0.09, 0.77, 0.1],
+      },
+      contract: DEFAULT_CONTACT_CONTRACTS.window,
       hitMeshes: [glass, windowHit, sill, mullionV, mullionH],
     });
   }
@@ -851,17 +884,17 @@ export class LofiRoomEnvironment {
     laptopGroup.add(lidPivot);
     deskGroup.add(laptopGroup);
 
-    this.interactiveProps.set('laptop', {
-      id: 'laptop',
-      label: '💻 노트북 화면 전환 / 타이핑 (Laptop)',
-      approachPos: new THREE.Vector3(-0.58, 0, -1.95),
-      approachYaw: -Math.PI / 2,
-      targetPose: 'type_desk',
-      reachTargetWorld: new THREE.Vector3(-1.12, 0.77, -1.92),
-      lookAtWorld: new THREE.Vector3(-1.22, 0.88, -1.92),
-      hoverAnchorWorld: new THREE.Vector3(-1.2, 1.02, -1.92),
-      hitMeshes: [laptopBase, lidBack, screenMesh],
-    });
+    const laptopKeyboardSurface: PropContactSurfaceLocal = {
+      shape: 'box',
+      localCenter: [0, 0.018, 0.04],
+      localHalfExtents: [0.14, 0.012, 0.08],
+      localNormal: [0, 1, 0],
+      localApproachDir: [0, 0, 1],
+      localFacingDir: [0, 0, -1],
+      approachStandOff: 0.45,
+      localLookAt: [0, 0.12, -0.06],
+      localHoverAnchor: [0, 0.26, 0],
+    };
 
     // 2) Articulated Desk Lamp (interactive prop)
     const lampGroup = new THREE.Group();
@@ -896,12 +929,20 @@ export class LofiRoomEnvironment {
     this.interactiveProps.set('desk_lamp', {
       id: 'desk_lamp',
       label: '💡 책상 스탠드 켜기/끄기 (Desk Lamp)',
-      approachPos: new THREE.Vector3(-0.62, 0, -2.35),
-      approachYaw: -Math.PI * 0.55,
       targetPose: 'reach_prop',
-      reachTargetWorld: new THREE.Vector3(-1.20, 1.04, -2.38),
-      lookAtWorld: new THREE.Vector3(-1.30, 1.04, -2.42),
-      hoverAnchorWorld: new THREE.Vector3(-1.26, 1.15, -2.4),
+      surfaceObject: lampGroup,
+      contactSurface: {
+        shape: 'box',
+        localCenter: [0.14, 0.28, 0.04],
+        localHalfExtents: [0.09, 0.09, 0.09],
+        localNormal: [1, 0, 0],
+        localApproachDir: [0.98, 0, 0.18],
+        localFacingDir: [-1, 0, 0],
+        approachStandOff: 0.48,
+        localLookAt: [0.04, 0.3, 0],
+        localHoverAnchor: [0.06, 0.42, 0.02],
+      },
+      contract: DEFAULT_CONTACT_CONTRACTS.desk_lamp,
       hitMeshes: [lampBase, arm1, arm2, shade, bulb],
     });
 
@@ -939,17 +980,17 @@ export class LofiRoomEnvironment {
     }
     deskGroup.add(mugGroup);
 
-    this.interactiveProps.set('coffee_mug', {
-      id: 'coffee_mug',
-      label: '☕ 따뜻한 커피 마시기 (Drink Coffee)',
-      approachPos: new THREE.Vector3(-0.58, 0, -1.95),
-      approachYaw: -Math.PI / 2,
-      targetPose: 'sip_mug',
-      reachTargetWorld: new THREE.Vector3(-0.96, 0.82, -1.48),
-      lookAtWorld: new THREE.Vector3(-0.96, 0.82, -1.48),
-      hoverAnchorWorld: new THREE.Vector3(-0.96, 0.94, -1.48),
-      hitMeshes: [mugBody, mugHandle, coaster],
-    });
+    const mugGripSurface: PropContactSurfaceLocal = {
+      shape: 'sphere',
+      localCenter: [0.02, 0.06, 0],
+      localHalfExtents: [0.05, 0.05, 0.05],
+      localNormal: [1, 0.2, 0],
+      localApproachDir: [1, 0, 0],
+      localFacingDir: [-1, 0, 0],
+      approachStandOff: 0.42,
+      localLookAt: [0, 0.07, 0],
+      localHoverAnchor: [0, 0.2, 0],
+    };
 
     // Books stack & notebook clutter on desk
     const bookColors = [0xff6b8b, 0x4be3ff, 0xfbbf24];
@@ -963,8 +1004,9 @@ export class LofiRoomEnvironment {
       deskGroup.add(b);
     }
 
-    // 4) Swivel Study Chair tucked behind desk (x = -0.60, z = -1.95)
+    // 4) Swivel Study Chair tucked behind desk (x = -0.58, z = -1.95)
     const chairGroup = new THREE.Group();
+    chairGroup.name = 'LofiDeskChair';
     chairGroup.position.set(-0.58, 0, -1.95);
     const chairCushionMat = track(
       new THREE.MeshStandardMaterial({color: 0x3b446e, roughness: 0.78})
@@ -989,16 +1031,60 @@ export class LofiRoomEnvironment {
     chairGroup.add(seat, backrest);
     deskGroup.add(chairGroup);
 
+    // Seat top surface declared strictly in chairGroup's local coordinate frame
+    // (`seat` is centered at y=0.43 with height=0.065 -> top face at local y=0.4625, facing -X)
+    const chairSeatSurface: PropContactSurfaceLocal = {
+      shape: 'box',
+      localCenter: [0, 0.4625, 0],
+      localHalfExtents: [0.21, 0.0325, 0.21],
+      localNormal: [0, 1, 0],
+      localApproachDir: [0.28, 0, 0.96],
+      localFacingDir: [-1, 0, 0],
+      approachStandOff: 0.44,
+      localLookAt: [-0.85, 1.05, 0],
+      localHoverAnchor: [0, 0.95, 0],
+    };
+
     this.interactiveProps.set('desk_chair', {
       id: 'desk_chair',
       label: '🪑 책상 의자에 앉기 (Sit at Desk)',
-      approachPos: new THREE.Vector3(-0.58, 0, -1.95),
-      approachYaw: -Math.PI / 2,
       targetPose: 'type_desk',
-      reachTargetWorld: new THREE.Vector3(-1.12, 0.77, -1.92),
-      lookAtWorld: new THREE.Vector3(-1.45, 1.15, -1.95),
-      hoverAnchorWorld: new THREE.Vector3(-0.58, 0.95, -1.95),
+      surfaceObject: chairGroup,
+      contactSurface: chairSeatSurface,
+      contract: DEFAULT_CONTACT_CONTRACTS.desk_chair,
+      secondarySurface: {
+        surfaceObject: laptopGroup,
+        contactSurface: laptopKeyboardSurface,
+      },
       hitMeshes: [seat, backrest, chairStem],
+    });
+
+    this.interactiveProps.set('laptop', {
+      id: 'laptop',
+      label: '💻 노트북 화면 전환 / 타이핑 (Laptop)',
+      targetPose: 'type_desk',
+      surfaceObject: chairGroup,
+      contactSurface: chairSeatSurface,
+      contract: DEFAULT_CONTACT_CONTRACTS.laptop,
+      secondarySurface: {
+        surfaceObject: laptopGroup,
+        contactSurface: laptopKeyboardSurface,
+      },
+      hitMeshes: [laptopBase, lidBack, screenMesh],
+    });
+
+    this.interactiveProps.set('coffee_mug', {
+      id: 'coffee_mug',
+      label: '☕ 따뜻한 커피 마시기 (Drink Coffee)',
+      targetPose: 'sip_mug',
+      surfaceObject: chairGroup,
+      contactSurface: chairSeatSurface,
+      contract: DEFAULT_CONTACT_CONTRACTS.coffee_mug,
+      secondarySurface: {
+        surfaceObject: mugGroup,
+        contactSurface: mugGripSurface,
+      },
+      hitMeshes: [mugBody, mugHandle, coaster],
     });
 
     this.group.add(deskGroup);
@@ -1080,24 +1166,40 @@ export class LofiRoomEnvironment {
     this.interactiveProps.set('bed', {
       id: 'bed',
       label: '🛏 침대에 걸터앉기 / 쉬기 (Sit on Bed)',
-      approachPos: new THREE.Vector3(0.32, 0, -1.85),
-      approachYaw: -Math.PI / 2,
       targetPose: 'sit_bed',
-      reachTargetWorld: new THREE.Vector3(0.48, 0.44, -1.85),
-      lookAtWorld: new THREE.Vector3(-0.3, 1.0, -1.1),
-      hoverAnchorWorld: new THREE.Vector3(0.85, 0.72, -1.9),
+      surfaceObject: bedGroup,
+      contactSurface: {
+        shape: 'box',
+        localCenter: [-0.36, 0.44, 0.18],
+        localHalfExtents: [0.18, 0.04, 0.34],
+        localNormal: [0, 1, 0],
+        localApproachDir: [-1, 0, 0],
+        localFacingDir: [-0.92, 0, 0.39],
+        approachStandOff: 0.44,
+        localLookAt: [-1.1, 1.0, 0.8],
+        localHoverAnchor: [-0.04, 0.72, 0.14],
+      },
+      contract: DEFAULT_CONTACT_CONTRACTS.bed,
       hitMeshes: [mattress, duvet, frame, headboard],
     });
 
     this.interactiveProps.set('cat_plushie', {
       id: 'cat_plushie',
       label: '🐱 고양이 쓰다듬기 (Pet Kitty)',
-      approachPos: new THREE.Vector3(0.20, 0, -1.68),
-      approachYaw: Math.PI * 0.42,
       targetPose: 'pet_cat',
-      reachTargetWorld: new THREE.Vector3(0.66, 0.56, -1.79),
-      lookAtWorld: new THREE.Vector3(0.66, 0.54, -1.79),
-      hoverAnchorWorld: new THREE.Vector3(0.66, 0.72, -1.79),
+      surfaceObject: this.catGroup,
+      contactSurface: {
+        shape: 'sphere',
+        localCenter: [0, 0.07, 0.03],
+        localHalfExtents: [0.12, 0.10, 0.12],
+        localNormal: [0, 1, 0],
+        localApproachDir: [-0.96, 0, 0.28],
+        localFacingDir: [0.96, 0, -0.28],
+        approachStandOff: 0.44,
+        localLookAt: [0, 0.06, 0.04],
+        localHoverAnchor: [0, 0.25, 0],
+      },
+      contract: DEFAULT_CONTACT_CONTRACTS.cat_plushie,
       hitMeshes: [catBody, catHead, earL, earR],
     });
   }
@@ -1178,12 +1280,20 @@ export class LofiRoomEnvironment {
     this.interactiveProps.set('bookshelf', {
       id: 'bookshelf',
       label: '🎵 바이닐 턴테이블 (Toggle Vinyl)',
-      approachPos: new THREE.Vector3(-0.10, 0, -2.35),
-      approachYaw: Math.PI,
       targetPose: 'reach_prop',
-      reachTargetWorld: new THREE.Vector3(0.12, 1.48, -2.86),
-      lookAtWorld: new THREE.Vector3(0.12, 1.54, -2.96),
-      hoverAnchorWorld: new THREE.Vector3(0.12, 1.66, -2.92),
+      surfaceObject: ttBase,
+      contactSurface: {
+        shape: 'box',
+        localCenter: [0, 0.025, 0.06],
+        localHalfExtents: [0.14, 0.03, 0.11],
+        localNormal: [0, 0.35, 0.94],
+        localApproachDir: [0, 0, 1],
+        localFacingDir: [0, 0, -1],
+        approachStandOff: 0.42,
+        localLookAt: [0, 0.06, 0],
+        localHoverAnchor: [0, 0.18, 0],
+      },
+      contract: DEFAULT_CONTACT_CONTRACTS.bookshelf,
       hitMeshes: [plank, ttBase, this.vinylDisc],
     });
   }
@@ -1303,12 +1413,20 @@ export class LofiRoomEnvironment {
     this.interactiveProps.set('toy_ball', {
       id: 'toy_ball',
       label: '🏀 별빛 공 튕기기 (Bounce Toy Ball)',
-      approachPos: new THREE.Vector3(-0.34, 0, -0.78),
-      approachYaw: Math.PI,
-      targetPose: 'reach_prop',
-      reachTargetWorld: new THREE.Vector3(-0.34, 0.11, -1.02),
-      lookAtWorld: new THREE.Vector3(-0.34, 0.14, -1.02),
-      hoverAnchorWorld: new THREE.Vector3(-0.34, 0.25, -1.02),
+      targetPose: 'kick_ball',
+      surfaceObject: ballGroup,
+      contactSurface: {
+        shape: 'sphere',
+        localCenter: [0, 0, 0],
+        localHalfExtents: [0.085, 0.085, 0.085],
+        localNormal: [0, 1, 0],
+        localApproachDir: [0, 0, 1],
+        localFacingDir: [0, 0, -1],
+        approachStandOff: 0.38,
+        localLookAt: [0, 0.04, 0],
+        localHoverAnchor: [0, 0.18, 0],
+      },
+      contract: DEFAULT_CONTACT_CONTRACTS.toy_ball,
       hitMeshes: [ballCore, eqRing, merRing],
     });
 
@@ -1366,12 +1484,20 @@ export class LofiRoomEnvironment {
     this.interactiveProps.set('floor_cushion', {
       id: 'floor_cushion',
       label: '🛋 방석 툭 밀기 (Nudge Cushion)',
-      approachPos: new THREE.Vector3(0.26, 0, -1.14),
-      approachYaw: Math.PI / 2,
-      targetPose: 'reach_prop',
-      reachTargetWorld: new THREE.Vector3(0.54, 0.09, -1.14),
-      lookAtWorld: new THREE.Vector3(0.54, 0.1, -1.14),
-      hoverAnchorWorld: new THREE.Vector3(0.54, 0.24, -1.14),
+      targetPose: 'push_prop',
+      surfaceObject: cushionGroup,
+      contactSurface: {
+        shape: 'box',
+        localCenter: [0, 0.02, 0],
+        localHalfExtents: [0.19, 0.055, 0.19],
+        localNormal: [0, 1, 0],
+        localApproachDir: [-1, 0, 0],
+        localFacingDir: [1, 0, 0],
+        approachStandOff: 0.36,
+        localLookAt: [0, 0.05, 0],
+        localHoverAnchor: [0, 0.20, 0],
+      },
+      contract: DEFAULT_CONTACT_CONTRACTS.floor_cushion,
       hitMeshes: [cushionBase, cushionTrim, centerTuft],
     });
 
@@ -1414,14 +1540,31 @@ export class LofiRoomEnvironment {
     this.interactiveProps.set('plush_die', {
       id: 'plush_die',
       label: '🎲 플러시 주사위 굴리기 (Roll Plush Die)',
-      approachPos: new THREE.Vector3(-0.14, 0, -0.62),
-      approachYaw: Math.PI,
-      targetPose: 'reach_prop',
-      reachTargetWorld: new THREE.Vector3(-0.14, 0.09, -0.82),
-      lookAtWorld: new THREE.Vector3(-0.14, 0.12, -0.82),
-      hoverAnchorWorld: new THREE.Vector3(-0.14, 0.24, -0.82),
+      targetPose: 'pickup_die',
+      surfaceObject: dieGroup,
+      contactSurface: {
+        shape: 'box',
+        localCenter: [0, 0, 0],
+        localHalfExtents: [0.072, 0.072, 0.072],
+        localNormal: [0, 1, 0],
+        localApproachDir: [0, 0, 1],
+        localFacingDir: [0, 0, -1],
+        approachStandOff: 0.34,
+        localLookAt: [0, 0.04, 0],
+        localHoverAnchor: [0, 0.18, 0],
+      },
+      contract: DEFAULT_CONTACT_CONTRACTS.plush_die,
       hitMeshes: [dieCube],
     });
+  }
+
+  /**
+   * Resolves a prop's live world contact surface directly from its Three.js Object3D world transform.
+   */
+  getPropWorldSurface(propId: RoomPropId): WorldContactSurface | null {
+    const prop = this.interactiveProps.get(propId);
+    if (!prop) return null;
+    return resolveWorldContactSurface(prop.contactSurface, prop.surfaceObject);
   }
 
   syncDynamicPropPose(
@@ -1432,17 +1575,7 @@ export class LofiRoomEnvironment {
     if (group) {
       group.position.set(pose.x, pose.y, pose.z);
       group.quaternion.set(pose.qx, pose.qy, pose.qz, pose.qw);
-    }
-    const prop = this.interactiveProps.get(id);
-    if (prop) {
-      prop.reachTargetWorld.set(pose.x, pose.y, pose.z);
-      prop.lookAtWorld.set(pose.x, pose.y + 0.04, pose.z);
-      prop.hoverAnchorWorld.set(pose.x, pose.y + 0.18, pose.z);
-      prop.approachPos.set(
-        THREE.MathUtils.clamp(pose.x, ROOM_WALK_BOUNDS.minX, ROOM_WALK_BOUNDS.maxX),
-        0,
-        THREE.MathUtils.clamp(pose.z + 0.22, ROOM_WALK_BOUNDS.minZ, ROOM_WALK_BOUNDS.maxZ)
-      );
+      group.updateMatrixWorld(true);
     }
   }
 
@@ -1494,10 +1627,14 @@ export class LofiRoomEnvironment {
     if (prop.id === 'floor' && floorPoint) {
       this.hoverRingMesh.position.set(floorPoint.x, 0.02, floorPoint.z);
     } else {
+      const liveSurface = resolveWorldContactSurface(
+        prop.contactSurface,
+        prop.surfaceObject
+      );
       this.hoverRingMesh.position.set(
-        prop.approachPos.x,
+        liveSurface.center.x,
         0.02,
-        prop.approachPos.z
+        liveSurface.center.z
       );
     }
     this.hoverRingMesh.visible = true;
@@ -1508,30 +1645,38 @@ export class LofiRoomEnvironment {
       this.deskLampOn = !this.deskLampOn;
       this.deskLampLight.intensity = this.deskLampOn ? 2.1 : 0.12;
       this.deskLampBulbMat.emissiveIntensity = this.deskLampOn ? 2.2 : 0.1;
-      return this.deskLampOn ? '책상 스탠드를 켰어요!' : '책상 스탠드를 은은하게 줄였어요!';
+      return this.deskLampOn
+        ? '책상 스탠드 쪽으로 이동해 조명을 켰다.'
+        : '책상 스탠드 쪽으로 이동해 조명을 은은하게 줄였다.';
     }
     if (propId === 'laptop') {
       this.laptopMode = (this.laptopMode + 1) % 3;
       drawLaptopScreen(this.laptopCanvas, this.laptopMode, performance.now() * 0.001);
       this.laptopTex.needsUpdate = true;
-      return '노트북 화면 모드를 바꿨어요!';
+      const modeDesc =
+        this.laptopMode === 0
+          ? '음악 비주얼라이저 화면'
+          : this.laptopMode === 1
+            ? '코드 작업 화면'
+            : '귀여운 표정 대기 화면';
+      return `책상으로 이동해 노트북 화면을 ${modeDesc}으로 바꾸고 타이핑을 시작했다.`;
     }
     if (propId === 'window') {
       this.rainEnabled = !this.rainEnabled;
       this.rainMesh.visible = this.rainEnabled;
       return this.rainEnabled
-        ? '창밖에 잔잔한 밤비가 내리기 시작했어요.'
-        : '창밖 빗소리가 멈추고 맑은 밤하늘이 보여요.';
+        ? '창가로 이동해 밖을 내다보았고, 창밖에 잔잔한 밤비가 내리기 시작했다.'
+        : '창가로 이동해 밖을 내다보았고, 빗소리가 멈춰 맑은 밤하늘이 보인다.';
     }
     if (propId === 'bookshelf') {
       this.vinylSpinning = !this.vinylSpinning;
       return this.vinylSpinning
-        ? '바이닐 턴테이블을 다시 재생했어요!'
-        : '바이닐 턴테이블을 잠시 멈췄어요.';
+        ? '책장 앞 바이닐 턴테이블로 이동해 음악을 다시 재생했다.'
+        : '책장 앞 바이닐 턴테이블로 이동해 음악 재생을 잠시 멈췄다.';
     }
     if (propId === 'cat_plushie') {
       this.catPurrBoost = 1.2;
-      return '냥이를 쓰담쓰담! 골골송이 들리는 것 같아요~';
+      return '침대 위의 고양이 인형에게 다가가 부드럽게 쓰다듬었다.';
     }
     return '';
   }

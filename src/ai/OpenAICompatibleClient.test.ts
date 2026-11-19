@@ -19,7 +19,7 @@ function makeCtx(): PluginExecutionContext {
   };
 }
 
-test('OpenAICompatibleClient forwards useServerDefaults=true and never mixes fallback on API failure', async () => {
+test('OpenAICompatibleClient forwards useServerDefaults=true and never falls back on API failure', async () => {
   const registry = new PluginRegistry();
   const client = new OpenAICompatibleClient(registry);
   client.setServerKeyAvailable(true);
@@ -40,7 +40,7 @@ test('OpenAICompatibleClient forwards useServerDefaults=true and never mixes fal
         client.generateReply({
           userText: '밤비 내리는 방 감성이 뭔데 ㅋㅋㅋ',
           history: [],
-          config: {...DEFAULT_OPENAI_CONFIG, demoFallbackEnabled: true},
+          config: {...DEFAULT_OPENAI_CONFIG},
           ctx: makeCtx(),
         }),
       /Incorrect API key provided/
@@ -79,7 +79,6 @@ test('OpenAICompatibleClient returns live API reply cleanly when upstream succee
       config: {...DEFAULT_OPENAI_CONFIG},
       ctx: makeCtx(),
     });
-    assert.equal(res.usedDemoFallback, false);
     assert.equal(res.emotion, AvatarEmotion.HAPPY);
     assert.equal(res.gesture, AvatarGesture.NOD);
     assert.equal(res.reply, '비 오는 창가에서 듣는 잔잔한 비트 감성이지!');
@@ -88,17 +87,96 @@ test('OpenAICompatibleClient returns live API reply cleanly when upstream succee
   }
 });
 
-test('OpenAICompatibleClient uses pure offline demo persona only when no API key is present', async () => {
+test('OpenAICompatibleClient never fabricates deterministic avatar speech when no API key is configured', async () => {
   const registry = new PluginRegistry();
   const client = new OpenAICompatibleClient(registry);
   client.setServerKeyAvailable(false);
 
-  const res = await client.generateReply({
-    userText: '안녕!',
+  await assert.rejects(
+    () =>
+      client.generateReply({
+        userText: '안녕!',
+        history: [],
+        config: {...DEFAULT_OPENAI_CONFIG},
+        ctx: makeCtx(),
+      }),
+    /LLM API가 설정되지 않았습니다/
+  );
+
+  const reaction = await client.generateActionReaction({
+    situation: '사용자가 AIMouto의 손을 잡고 방 안을 약 1.1m 걸어 침대 근처까지 함께 이동한 뒤 손을 놓았다.',
     history: [],
-    config: {...DEFAULT_OPENAI_CONFIG, demoFallbackEnabled: true},
+    config: {...DEFAULT_OPENAI_CONFIG},
     ctx: makeCtx(),
   });
-  assert.equal(res.usedDemoFallback, true);
-  assert.ok(!res.reply.includes('API fallback'));
+  assert.equal(reaction, null);
+
+  const greeting = await client.generateStartupGreeting({
+    config: {...DEFAULT_OPENAI_CONFIG},
+    ctx: makeCtx(),
+  });
+  assert.equal(greeting, null);
+});
+
+test('generateActionReaction sends factual situation (prop or hand-hold) and prior history to LLM while excluding trigger_room_action', async () => {
+  const registry = new PluginRegistry();
+  const client = new OpenAICompatibleClient(registry);
+  client.setServerKeyAvailable(true);
+
+  type CapturedRequestBody = {
+    messages?: Array<{role: string; content: string}>;
+    tools?: Array<{function: {name: string}}>;
+  };
+  let capturedBody: CapturedRequestBody = {};
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
+    capturedBody = JSON.parse(String(init?.body ?? '{}')) as CapturedRequestBody;
+    return new Response(
+      JSON.stringify({
+        choices: [
+          {
+            message: {
+              role: 'assistant',
+              content: '갑자기 손잡고 침대 쪽으로 데려오다니 좀 놀랐잖아~ [emotion:love]',
+            },
+          },
+        ],
+      }),
+      {status: 200, headers: {'Content-Type': 'application/json'}}
+    );
+  }) as typeof fetch;
+
+  try {
+    const res = await client.generateActionReaction({
+      situation:
+        '사용자가 AIMouto의 손을 잡고 방 안을 약 1.2m 걸어 침대 근처까지 함께 이동한 뒤 손을 놓았다.',
+      history: [
+        {
+          id: 'u-1',
+          role: 'user',
+          content: '잠깐 이쪽으로 같이 가자',
+          timestamp: 1,
+        },
+      ],
+      config: {...DEFAULT_OPENAI_CONFIG},
+      ctx: makeCtx(),
+    });
+
+    assert.ok(res !== null);
+    assert.equal(res.reply, '갑자기 손잡고 침대 쪽으로 데려오다니 좀 놀랐잖아~');
+    assert.equal(res.emotion, AvatarEmotion.LOVE);
+
+    const msgs = capturedBody.messages ?? [];
+    assert.ok(msgs.some((m) => m.content.includes('잠깐 이쪽으로 같이 가자')));
+    assert.ok(
+      msgs.some((m) =>
+        m.content.includes('손을 잡고 방 안을 약 1.2m 걸어 침대 근처까지 함께 이동한 뒤 손을 놓았다.')
+      )
+    );
+    const toolNames = (capturedBody.tools ?? []).map((t) => t.function.name);
+    assert.ok(!toolNames.includes('move_and_interact_room'));
+    assert.ok(toolNames.includes('set_avatar_expression'));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
